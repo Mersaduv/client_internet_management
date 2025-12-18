@@ -5,6 +5,7 @@ import 'screens/login_screen.dart';
 import 'screens/connection_test_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/device_detail_screen.dart';
+import 'screens/internet_service_screen.dart';
 import 'services/mikrotik_service_manager.dart';
 import 'models/client_info.dart';
 import 'providers/clients_provider.dart';
@@ -62,9 +63,8 @@ class MyApp extends StatelessWidget {
       initialRoute: '/',
       routes: {
         '/': (context) => const LoginScreen(),
-        '/home': (context) => const HomePage(),
+        '/home': (context) => const MainScaffold(),
         '/test': (context) => const ConnectionTestScreen(),
-        '/settings': (context) => const SettingsScreen(),
         '/device-detail': (context) {
           final args = ModalRoute.of(context)!.settings.arguments as Map<String, dynamic>;
           return DeviceDetailScreen(
@@ -79,54 +79,26 @@ class MyApp extends StatelessWidget {
   }
 }
 
-class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+/// MainScaffold با bottom navigation ثابت برای همه صفحات
+class MainScaffold extends StatefulWidget {
+  const MainScaffold({super.key});
 
   @override
-  State<HomePage> createState() => _HomePageState();
+  State<MainScaffold> createState() => _MainScaffoldState();
 }
 
-class _HomePageState extends State<HomePage> {
-  final MikroTikServiceManager _serviceManager = MikroTikServiceManager();
+class _MainScaffoldState extends State<MainScaffold> {
   int _currentIndex = 0;
-  int _selectedTab = 0; // 0: متصل, 1: مسدود
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      // مقداردهی اولیه Provider
-      final provider = Provider.of<ClientsProvider>(context, listen: false);
-      provider.initialize();
-    });
-  }
+  final MikroTikServiceManager _serviceManager = MikroTikServiceManager();
 
   void _onTabTapped(int index) {
-    setState(() {
-      _currentIndex = index;
-    });
-    
-    if (index == 1) {
-      // صفحه تنظیمات
-      Navigator.pushNamed(context, '/settings');
-      // بعد از بازگشت، به تب اول برگرد
-      Future.delayed(const Duration(milliseconds: 100), () {
-        if (mounted) {
-          setState(() {
-            _currentIndex = 0;
-          });
-        }
-      });
-    } else if (index == 2) {
-      // به‌روزرسانی لیست
-      final provider = Provider.of<ClientsProvider>(context, listen: false);
-      provider.refresh();
-      setState(() {
-        _currentIndex = 0;
-      });
-    } else if (index == 3) {
+    if (index == 3) {
       // خروج
       _handleLogout();
+    } else {
+      setState(() {
+        _currentIndex = index;
+      });
     }
   }
 
@@ -137,6 +109,117 @@ class _HomePageState extends State<HomePage> {
     if (mounted) {
       Navigator.of(context).pushReplacementNamed('/');
     }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(
+        index: _currentIndex,
+        children: const [
+          HomePage(),
+          SettingsScreen(),
+          InternetServiceScreen(),
+        ],
+      ),
+      bottomNavigationBar: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.05),
+              blurRadius: 10,
+              offset: const Offset(0, -2),
+            ),
+          ],
+        ),
+        child: SafeArea(
+          child: Container(
+            height: 60,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _buildNavItem(
+                  icon: Icons.home_outlined,
+                  activeIcon: Icons.home,
+                  label: 'خانه',
+                  index: 0,
+                  isActive: _currentIndex == 0,
+                ),
+                _buildNavItem(
+                  icon: Icons.settings_outlined,
+                  activeIcon: Icons.settings,
+                  label: 'تنظیمات',
+                  index: 1,
+                  isActive: _currentIndex == 1,
+                ),
+                _buildNavItem(
+                  icon: Icons.wifi_outlined,
+                  activeIcon: Icons.wifi,
+                  label: 'سرویس انترنت',
+                  index: 2,
+                  isActive: _currentIndex == 2,
+                ),
+                _buildNavItem(
+                  icon: Icons.logout_outlined,
+                  activeIcon: Icons.logout,
+                  label: 'خروج',
+                  index: 3,
+                  isActive: false,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNavItem({
+    required IconData icon,
+    required IconData activeIcon,
+    required String label,
+    required int index,
+    required bool isActive,
+  }) {
+    return InkWell(
+      onTap: () => _onTabTapped(index),
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        width: 60,
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        child: Icon(
+          isActive ? activeIcon : icon,
+          color: isActive
+              ? const Color(0xFF428B7C)
+              : Colors.grey.shade600,
+          size: 28,
+        ),
+      ),
+    );
+  }
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  final MikroTikServiceManager _serviceManager = MikroTikServiceManager();
+  int _selectedTab = 0; // 0: متصل, 1: مسدود
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // مقداردهی اولیه Provider
+      final provider = Provider.of<ClientsProvider>(context, listen: false);
+      provider.initialize();
+    });
   }
 
   @override
@@ -275,82 +358,6 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
           ],
-        ),
-      ),
-      bottomNavigationBar: Container(
-        decoration: BoxDecoration(
-          color: Colors.white,
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.05),
-              blurRadius: 10,
-              offset: const Offset(0, -2),
-            ),
-          ],
-        ),
-        child: SafeArea(
-          child: Container(
-            height: 60,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                _buildNavItem(
-                  icon: Icons.home,
-                  activeIcon: Icons.home,
-                  label: 'خانه',
-                  index: 0,
-                  isActive: _currentIndex == 0,
-                ),
-                _buildNavItem(
-                  icon: Icons.settings_outlined,
-                  activeIcon: Icons.settings,
-                  label: 'تنظیمات',
-                  index: 1,
-                  isActive: _currentIndex == 1,
-                ),
-                _buildNavItem(
-                  icon: Icons.refresh_outlined,
-                  activeIcon: Icons.refresh,
-                  label: 'به‌روزرسانی',
-                  index: 2,
-                  isActive: _currentIndex == 2,
-                ),
-                _buildNavItem(
-                  icon: Icons.logout_outlined,
-                  activeIcon: Icons.logout,
-                  label: 'خروج',
-                  index: 3,
-                  isActive: _currentIndex == 3,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildNavItem({
-    required IconData icon,
-    required IconData activeIcon,
-    required String label,
-    required int index,
-    required bool isActive,
-  }) {
-    return Expanded(
-      child: InkWell(
-        onTap: () => _onTabTapped(index),
-        borderRadius: BorderRadius.circular(12),
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 12),
-          child: Icon(
-            isActive ? activeIcon : icon,
-            color: isActive
-                ? const Color(0xFF428B7C)
-                : Colors.grey.shade600,
-            size: 28,
-          ),
         ),
       ),
     );

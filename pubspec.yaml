@@ -48,6 +48,9 @@ dependencies:
   
   # Provider برای مدیریت state
   provider: ^6.1.1
+  
+  # WebView برای نمایش وب‌سایت در برنامه
+  flutter_inappwebview: ^6.1.0+11
 
 dev_dependencies:
   flutter_test:

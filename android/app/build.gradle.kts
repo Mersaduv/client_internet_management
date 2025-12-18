@@ -24,6 +24,7 @@ android {
         applicationId = "com.example.internet_management"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
+        // حداقل SDK 19 برای flutter_inappwebview
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

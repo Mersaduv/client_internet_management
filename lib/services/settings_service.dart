@@ -9,16 +9,19 @@ class SettingsService {
   static const String _keyHost = 'mikrotik_host';
   static const String _keyPort = 'mikrotik_port';
   static const String _keyUseSsl = 'mikrotik_use_ssl';
+  static const String _keyServiceUrl = 'internet_service_url';
 
   // مقادیر پیش‌فرض
   static const String _defaultHost = '192.168.88.1';
   static const int _defaultPort = 8728;
   static const bool _defaultUseSsl = false;
+  static const String _defaultServiceUrl = 'http://user.ariyabod.af/users/computer/DS_MyInternet.php';
 
   // Cache برای تنظیمات (برای جلوگیری از خطا در صورت مشکل shared_preferences)
   String? _cachedHost;
   int? _cachedPort;
   bool? _cachedUseSsl;
+  String? _cachedServiceUrl;
 
   /// دریافت Host
   Future<String> getHost() async {
@@ -104,12 +107,40 @@ class SettingsService {
     }
   }
 
+  /// دریافت URL سرویس اینترنت
+  Future<String> getServiceUrl() async {
+    if (_cachedServiceUrl != null) {
+      return _cachedServiceUrl!;
+    }
+    
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _cachedServiceUrl = prefs.getString(_keyServiceUrl) ?? _defaultServiceUrl;
+      return _cachedServiceUrl!;
+    } catch (e) {
+      _cachedServiceUrl = _defaultServiceUrl;
+      return _defaultServiceUrl;
+    }
+  }
+
+  /// ذخیره URL سرویس اینترنت
+  Future<void> setServiceUrl(String url) async {
+    _cachedServiceUrl = url;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyServiceUrl, url);
+    } catch (e) {
+      // اگر shared_preferences کار نکرد، فقط در حافظه نگه دار
+    }
+  }
+
   /// دریافت همه تنظیمات
   Future<Map<String, dynamic>> getAllSettings() async {
     return {
       'host': await getHost(),
       'port': await getPort(),
       'useSsl': await getUseSsl(),
+      'serviceUrl': await getServiceUrl(),
     };
   }
 
@@ -118,12 +149,14 @@ class SettingsService {
     _cachedHost = null;
     _cachedPort = null;
     _cachedUseSsl = null;
+    _cachedServiceUrl = null;
     
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_keyHost);
       await prefs.remove(_keyPort);
       await prefs.remove(_keyUseSsl);
+      await prefs.remove(_keyServiceUrl);
     } catch (e) {
       // اگر shared_preferences کار نکرد، فقط cache را پاک کن
     }
