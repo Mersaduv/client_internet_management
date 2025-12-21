@@ -1,15 +1,21 @@
+import 'dart:io';
 import '../models/mikrotik_connection.dart';
 import '../models/client_info.dart';
+import '../models/device_fingerprint.dart';
+import '../services/device_fingerprint_service.dart';
 import 'routeros_client_v2.dart' show RouterOSClientV2;
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// سرویس برای مدیریت اتصال و عملیات MikroTik RouterOS
 /// مشابه endpointهای /api/clients/* در پروژه Python
 class MikroTikService {
   RouterOSClientV2? _client;
+  MikroTikConnection? _connection;
 
   /// اتصال به MikroTik RouterOS
   Future<bool> connect(MikroTikConnection connection) async {
     try {
+      _connection = connection;
       _client = RouterOSClientV2(
         address: connection.host,
         user: connection.username,
@@ -21,10 +27,12 @@ class MikroTikService {
       final success = await _client!.login();
       if (!success) {
         _client = null;
+        _connection = null;
       }
       return success;
     } catch (e) {
       _client = null;
+      _connection = null;
       throw Exception('خطا در اتصال: $e');
     }
   }
@@ -36,6 +44,7 @@ class MikroTikService {
   void disconnect() {
     _client?.close();
     _client = null;
+    _connection = null;
   }
 
   /// دریافت همه کاربران و دستگاه‌های متصل
@@ -419,15 +428,47 @@ class MikroTikService {
     }
   }
 
+  /// مسدود کردن کلاینت با استفاده از Device Fingerprint
+  /// این تابع Device Fingerprint را محاسبه می‌کند و ذخیره می‌کند
+  /// تا حتی با تغییر IP/MAC، دستگاه شناسایی شود
+  Future<bool> banClientWithFingerprint(
+    String ipAddress, {
+    String? macAddress,
+    String? hostname,
+    String? ssid,
+  }) async {
+    // ایجاد Device Fingerprint
+    final fingerprint = DeviceFingerprint.fromClientInfo(
+      ipAddress,
+      macAddress,
+      hostname,
+      ssid,
+    );
+
+    // ذخیره Device Fingerprint
+    final fingerprintService = DeviceFingerprintService();
+    await fingerprintService.saveBannedFingerprint(fingerprint);
+
+    // ایجاد comment با Device Fingerprint
+    final fingerprintComment = 'Banned: ${fingerprint.fingerprintId}';
+    
+    // مسدود کردن با استفاده از banClient اصلی
+    return await banClient(
+      ipAddress,
+      macAddress: macAddress,
+      comment: fingerprintComment,
+    );
+  }
+
   /// مسدود کردن کلاینت
   /// مشابه POST /api/clients/ban
+  /// از Raw rules استفاده می‌کند (بهتر از filter rules برای تعداد زیاد)
   /// از چند بخش مسدود می‌کند:
-  /// 1. Firewall Input Chain
-  /// 2. Firewall Forward Chain (بر اساس IP)
-  /// 3. Firewall Forward Chain (بر اساس MAC - مستقل از IP)
-  /// 4. DHCP Block Access
-  /// 5. Wireless Access List
-  Future<bool> banClient(String ipAddress, {String? macAddress}) async {
+  /// 1. Firewall Raw Prerouting Chain (بر اساس IP)
+  /// 2. Firewall Raw Prerouting Chain (بر اساس MAC - مستقل از IP)
+  /// 3. DHCP Block Access
+  /// 4. Wireless Access List
+  Future<bool> banClient(String ipAddress, {String? macAddress, String? comment}) async {
     if (_client == null || !isConnected) {
       throw Exception('اتصال برقرار نشده');
     }
@@ -461,13 +502,13 @@ class MikroTikService {
         }
       }
 
-      // بررسی اینکه آیا قبلاً مسدود شده است
+      // بررسی اینکه آیا قبلاً مسدود شده است (بررسی Raw rules)
       try {
-        final filters = await _client!.talk(['/ip/firewall/filter/print']);
-        for (var f in filters) {
-          if ((f['chain'] == 'input' || f['chain'] == 'forward') &&
-              f['src-address'] == ipAddress &&
-              f['action'] == 'drop') {
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (var rule in rawRules) {
+          if (rule['chain'] == 'prerouting' &&
+              rule['src-address'] == ipAddress &&
+              rule['action'] == 'drop') {
             // قبلاً مسدود شده است
             return true;
           }
@@ -476,46 +517,38 @@ class MikroTikService {
         // ignore
       }
 
-      final comment = 'Banned via Flutter App';
+      // استفاده از comment داده شده یا comment پیش‌فرض
+      final banComment = comment ?? 'Banned via Flutter App';
 
-      // 1. Firewall Input Chain - مسدود کردن ترافیک ورودی به روتر
+      // 1. Firewall Raw Prerouting Chain - مسدود کردن ترافیک بر اساس IP
+      // Raw rules قبل از connection tracking پردازش می‌شوند و سریع‌تر هستند
       try {
-        final inputCommand = ['/ip/firewall/filter/add', '=chain=input', '=src-address=$ipAddress', '=action=drop', '=comment=$comment - Input'];
+        final rawCommand = ['/ip/firewall/raw/add', '=chain=prerouting', '=src-address=$ipAddress', '=action=drop', '=comment=$banComment - IP'];
         if (macToUse != null) {
-          inputCommand.add('=src-mac-address=$macToUse');
+          rawCommand.add('=src-mac-address=$macToUse');
         }
-        await _client!.talk(inputCommand);
+        await _client!.talk(rawCommand);
       } catch (e) {
         // ignore - ادامه بده
       }
 
-      // 2. Firewall Forward Chain - مسدود کردن ترافیک forward (خروجی به اینترنت)
-      try {
-        final forwardCommand = ['/ip/firewall/filter/add', '=chain=forward', '=src-address=$ipAddress', '=action=drop', '=comment=$comment - Forward'];
-        if (macToUse != null) {
-          forwardCommand.add('=src-mac-address=$macToUse');
-        }
-        await _client!.talk(forwardCommand);
-      } catch (e) {
-        // ignore - ادامه بده
-      }
-
-      // 3. Firewall Forward MAC Chain - مسدود کردن بر اساس MAC (مستقل از IP)
+      // 2. Firewall Raw Prerouting MAC Chain - مسدود کردن بر اساس MAC (مستقل از IP)
+      // این rule حتی اگر IP تغییر کند، دستگاه را مسدود می‌کند
       if (macToUse != null) {
         try {
           await _client!.talk([
-            '/ip/firewall/filter/add',
-            '=chain=forward',
+            '/ip/firewall/raw/add',
+            '=chain=prerouting',
             '=src-mac-address=$macToUse',
             '=action=drop',
-            '=comment=$comment - Forward MAC Only',
+            '=comment=$banComment - MAC',
           ]);
         } catch (e) {
           // ignore - ادامه بده
         }
       }
 
-      // 4. DHCP Block Access - Block کردن DHCP lease
+      // 3. DHCP Block Access - Block کردن DHCP lease
       if (macToUse != null) {
         try {
           final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
@@ -538,7 +571,7 @@ class MikroTikService {
         }
       }
 
-      // 5. Wireless Access List - مسدود کردن اتصال وای‌فای
+      // 4. Wireless Access List - مسدود کردن اتصال وای‌فای
       if (macToUse != null) {
         try {
           // بررسی اینکه آیا MAC قبلاً در access list block شده
@@ -593,10 +626,197 @@ class MikroTikService {
         }
       }
 
+      // 5. ایجاد Static IP - برای شناسایی بهتر دستگاه در آینده
+      // با Static IP، دستگاه همیشه همان IP را می‌گیرد و شناسایی راحت‌تر می‌شود
+      if (macToUse != null) {
+        try {
+          // پیدا کردن hostname از DHCP lease
+          String? hostname;
+          try {
+            final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+            for (var lease in dhcpLeases) {
+              final leaseMac = lease['mac-address']?.toString().toUpperCase();
+              if (leaseMac == macToUse.toUpperCase()) {
+                hostname = lease['host-name'];
+                break;
+              }
+            }
+          } catch (e) {
+            // ignore
+          }
+
+          await _createOrUpdateStaticLease(
+            ipAddress,
+            macToUse,
+            hostname: hostname,
+            comment: '$banComment - Static IP',
+          );
+        } catch (e) {
+          // ignore - ادامه بده
+        }
+      }
+
       return true;
     } catch (e) {
       throw Exception('خطا در مسدود کردن کلاینت: $e');
     }
+  }
+
+  /// رفع مسدودیت کلاینت با استفاده از Device Fingerprint
+  Future<bool> unbanClientWithFingerprint(
+    String ipAddress, {
+    String? macAddress,
+    String? hostname,
+    String? ssid,
+  }) async {
+    // ایجاد Device Fingerprint
+    final fingerprint = DeviceFingerprint.fromClientInfo(
+      ipAddress,
+      macAddress,
+      hostname,
+      ssid,
+    );
+
+    // ابتدا حذف همه rule های firewall مربوط به این Device Fingerprint
+    // این اطمینان می‌دهد که rule ها قبل از حذف Device Fingerprint حذف می‌شوند
+    try {
+      if (_client != null && isConnected) {
+        final fingerprintService = DeviceFingerprintService();
+        final fingerprintId = fingerprint.fingerprintId;
+        
+        // حذف همه rule های firewall که comment آن‌ها شامل fingerprintId است
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (var rule in rawRules) {
+          final ruleComment = rule['comment']?.toString() ?? '';
+          if (ruleComment.contains('Auto-banned:') && 
+              ruleComment.contains(fingerprintId)) {
+            final ruleId = rule['.id']?.toString();
+            if (ruleId != null) {
+              try {
+                await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
+              } catch (e) {
+                // ignore
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // حذف Device Fingerprint
+    final fingerprintService = DeviceFingerprintService();
+    await fingerprintService.removeBannedFingerprint(fingerprint);
+
+    // رفع مسدودیت با استفاده از unbanClient اصلی
+    final success = await unbanClient(ipAddress, macAddress: macAddress);
+    
+    // اگر قفل فعال است، دستگاه را به لیست مجاز اضافه کن تا دیگر auto-ban نشود
+    if (success) {
+      try {
+        final isLocked = await isNewConnectionsLocked();
+        if (isLocked) {
+          // پیدا کردن MAC اگر داده نشده باشد
+          String? macToUse = macAddress;
+          if (macToUse == null) {
+            try {
+              final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+              for (var lease in dhcpLeases) {
+                if (lease['address'] == ipAddress) {
+                  macToUse = lease['mac-address'];
+                  break;
+                }
+              }
+              if (macToUse == null) {
+                final arpEntries = await _client!.talk(['/ip/arp/print']);
+                for (var arp in arpEntries) {
+                  if (arp['address'] == ipAddress) {
+                    macToUse = arp['mac-address'];
+                    break;
+                  }
+                }
+              }
+            } catch (e) {
+              // ignore
+            }
+          }
+          
+          // اضافه کردن به لیست مجاز
+          if (macToUse != null || ipAddress.isNotEmpty) {
+            final prefs = await SharedPreferences.getInstance();
+            
+            // اضافه کردن MAC به لیست مجاز
+            if (macToUse != null) {
+              final allowedMacsList = prefs.getStringList('locked_allowed_macs') ?? [];
+              final macUpper = macToUse.toUpperCase();
+              if (!allowedMacsList.contains(macUpper)) {
+                allowedMacsList.add(macUpper);
+                await prefs.setStringList('locked_allowed_macs', allowedMacsList);
+              }
+            }
+            
+            // اضافه کردن IP به لیست مجاز
+            final allowedIpsList = prefs.getStringList('locked_allowed_ips') ?? [];
+            if (!allowedIpsList.contains(ipAddress)) {
+              allowedIpsList.add(ipAddress);
+              await prefs.setStringList('locked_allowed_ips', allowedIpsList);
+            }
+            
+            // اضافه کردن به wireless access list با action=allow
+            if (macToUse != null) {
+              try {
+                final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+                bool macExists = false;
+                for (var acl in accessList) {
+                  final aclMac = acl['mac-address']?.toString().toUpperCase();
+                  if (aclMac == macToUse.toUpperCase()) {
+                    macExists = true;
+                    // اگر action allow نیست، آن را allow کن
+                    if (acl['action'] != 'allow') {
+                      final aclId = acl['.id'];
+                      if (aclId != null) {
+                        try {
+                          await _client!.talk([
+                            '/interface/wireless/access-list/set',
+                            '=.id=$aclId',
+                            '=action=allow',
+                            '=comment=Lock New Connections - Allowed Device',
+                          ]);
+                        } catch (e) {
+                          // ignore
+                        }
+                      }
+                    }
+                    break;
+                  }
+                }
+                
+                // اگر MAC در access list نیست، اضافه کن
+                if (!macExists) {
+                  try {
+                    await _client!.talk([
+                      '/interface/wireless/access-list/add',
+                      '=mac-address=$macToUse',
+                      '=action=allow',
+                      '=comment=Lock New Connections - Allowed Device',
+                    ]);
+                  } catch (e) {
+                    // ignore
+                  }
+                }
+              } catch (e) {
+                // ignore
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ignore errors - اضافه کردن به لیست مجاز optional است
+      }
+    }
+    
+    return success;
   }
 
   /// رفع مسدودیت کلاینت
@@ -634,37 +854,59 @@ class MikroTikService {
 
       int removedCount = 0;
 
-      // 1. حذف Firewall Rules
+      // 1. حذف Raw Firewall Rules (همه rule های مربوط به این IP/MAC)
+      // حذف همه rule های auto-banned و rule های دستی مربوط به این دستگاه
+      // شامل rule هایی که فقط IP دارند، فقط MAC دارند، یا هر دو
+      // حذف همه rule ها بدون توجه به action یا chain (برای اطمینان از حذف کامل)
       try {
-        final filters = await _client!.talk(['/ip/firewall/filter/print']);
-        for (var f in filters) {
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        final rulesToRemove = <String>[];
+        
+        for (var rule in rawRules) {
           bool shouldRemove = false;
-          if (f['src-address'] == ipAddress) {
+          final ruleIp = rule['src-address']?.toString();
+          final ruleMac = rule['src-mac-address']?.toString();
+          
+          // بررسی تطابق IP
+          if (ruleIp != null && ruleIp.isNotEmpty && ruleIp == ipAddress) {
             shouldRemove = true;
           }
-          if (macToUse != null && f['src-mac-address'] == macToUse) {
+          
+          // بررسی تطابق MAC (حتی اگر IP متفاوت باشد)
+          if (macToUse != null && ruleMac != null && ruleMac.toUpperCase() == macToUse.toUpperCase()) {
             shouldRemove = true;
           }
 
-          if (shouldRemove &&
-              f['action'] == 'drop' &&
-              (f['chain'] == 'input' || f['chain'] == 'forward')) {
-            final ruleId = f['.id'];
-            if (ruleId != null) {
-              try {
-                await _client!.talk(['/ip/firewall/filter/remove', '=.id=$ruleId']);
-                removedCount++;
-              } catch (e) {
-                // ignore
-              }
+          // حذف همه rule های مربوط به این IP/MAC (بدون توجه به comment، action یا chain)
+          // این شامل rule های auto-banned (با همه comment های ممکن) و rule های دستی می‌شود
+          // comment های auto-banned ممکن است شامل:
+          // - "Auto-banned: New connection while locked"
+          // - "Auto-banned: New connection while locked - IP"
+          // - "Auto-banned: New connection while locked - MAC"
+          // - "Banned:" یا "Banned via Flutter App" (مسدود دستی)
+          if (shouldRemove) {
+            final ruleId = rule['.id']?.toString();
+            if (ruleId != null && !rulesToRemove.contains(ruleId)) {
+              rulesToRemove.add(ruleId);
             }
+          }
+        }
+        
+        // حذف همه rule ها
+        for (var ruleId in rulesToRemove) {
+          try {
+            await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
+            removedCount++;
+          } catch (e) {
+            // ignore
           }
         }
       } catch (e) {
         // ignore
       }
 
-      // 2. رفع Block از DHCP Lease
+      // 2. رفع Block از DHCP Lease (همه lease های مربوط به این MAC)
+      // رفع block از همه lease هایی که comment آن‌ها مربوط به auto-banned است یا بدون comment
       if (macToUse != null) {
         try {
           final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
@@ -672,7 +914,10 @@ class MikroTikService {
             final leaseMac = lease['mac-address']?.toString().toUpperCase();
             if (leaseMac == macToUse.toUpperCase()) {
               final leaseId = lease['.id'];
-              if (leaseId != null) {
+              
+              // رفع block از همه lease ها (بدون توجه به comment)
+              // این شامل lease های auto-banned (با comment "Auto-banned: New connection while locked - Static IP") می‌شود
+              if (leaseId != null && lease['block-access']?.toString().toLowerCase() == 'yes') {
                 try {
                   await _client!.talk([
                     '/ip/dhcp-server/lease/set',
@@ -692,26 +937,57 @@ class MikroTikService {
       }
 
       // 3. رفع Block از Wireless Access List
+      // حذف یا allow کردن همه rule های مربوط به این MAC (بدون توجه به action)
       if (macToUse != null) {
         try {
           final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
           for (var acl in accessList) {
             final aclMac = acl['mac-address']?.toString().toUpperCase();
-            if (aclMac == macToUse.toUpperCase() &&
-                (acl['action'] == 'reject' || acl['action'] == 'deny')) {
+            if (aclMac == macToUse.toUpperCase()) {
               final aclId = acl['.id'];
+              final aclComment = acl['comment']?.toString();
+              final aclAction = acl['action']?.toString();
+              
               if (aclId != null) {
                 try {
-                  // حذف از access list
-                  await _client!.talk([
-                    '/interface/wireless/access-list/remove',
-                    '=.id=$aclId',
-                  ]);
+                  // اگر action deny یا reject است، باید رفع مسدودیت شود
+                  if (aclAction == 'deny' || aclAction == 'reject') {
+                    // اگر comment مربوط به قفل است (auto-banned)، حذف کن
+                    // اما اگر comment مربوط به مسدود دستی است، فقط action را allow کن (نه حذف)
+                    bool isAutoBanned = aclComment != null && 
+                                        (aclComment.contains('Auto-banned: New connection while locked') ||
+                                         aclComment == 'Lock New Connections - Allowed Device');
+                    
+                    if (isAutoBanned) {
+                      // حذف از access list (auto-banned)
+                      await _client!.talk([
+                        '/interface/wireless/access-list/remove',
+                        '=.id=$aclId',
+                      ]);
+                    } else {
+                      // فقط action را allow کن (مسدود دستی - نباید حذف شود)
+                      await _client!.talk([
+                        '/interface/wireless/access-list/set',
+                        '=.id=$aclId',
+                        '=action=allow',
+                      ]);
+                    }
+                  } else if (aclAction == 'allow') {
+                    // اگر قبلاً allow است، نیازی به تغییر نیست
+                    // اما اگر comment مربوط به قفل است، حذف کن (برای پاکسازی)
+                    bool isLockRelated = aclComment != null && 
+                                         aclComment == 'Lock New Connections - Allowed Device';
+                    if (isLockRelated) {
+                      await _client!.talk([
+                        '/interface/wireless/access-list/remove',
+                        '=.id=$aclId',
+                      ]);
+                    }
+                  }
                 } catch (e) {
                   // ignore
                 }
               }
-              break;
             }
           }
         } catch (e) {
@@ -719,7 +995,13 @@ class MikroTikService {
         }
       }
 
-      return removedCount > 0;
+      // اگر هیچ rule ای حذف نشد اما MAC یا IP وجود دارد، باز هم true برگردان
+      // چون ممکن است rule های دیگر (DHCP, Wireless) حذف شده باشند
+      if (removedCount > 0 || macToUse != null || ipAddress.isNotEmpty) {
+        return true;
+      }
+      
+      return false;
     } catch (e) {
       throw Exception('خطا در رفع مسدودیت کلاینت: $e');
     }
@@ -727,31 +1009,35 @@ class MikroTikService {
 
   /// دریافت لیست کلاینت‌های مسدود شده
   /// مشابه POST /api/clients/banned
-  /// از firewall rules استفاده می‌کند (نه address-list)
+  /// از Raw firewall rules استفاده می‌کند (بهتر از filter rules برای تعداد زیاد)
   Future<List<Map<String, dynamic>>> getBannedClients() async {
     if (_client == null || !isConnected) {
       throw Exception('اتصال برقرار نشده');
     }
 
     try {
-      // پیدا کردن firewall rules با action=drop
-      final filters = await _client!.talk(['/ip/firewall/filter/print']);
+      // پیدا کردن Raw firewall rules با action=drop
+      final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
       
-      // فیلتر کردن rules با action=drop و chain=input یا forward
+      // فیلتر کردن rules با action=drop و chain=prerouting
       final banRules = <Map<String, dynamic>>[];
-      for (var f in filters) {
-        if (f['action'] == 'drop' &&
-            (f['chain'] == 'input' || f['chain'] == 'forward')) {
-          banRules.add(f);
+      for (var rule in rawRules) {
+        if (rule['action'] == 'drop' &&
+            rule['chain'] == 'prerouting') {
+          banRules.add(rule);
         }
       }
 
-      // گروه‌بندی rules بر اساس IP
+      // گروه‌بندی rules بر اساس IP و MAC
+      // توجه: ممکن است rule هایی فقط با MAC (بدون IP) وجود داشته باشند
       final ipToRules = <String, Map<String, dynamic>>{};
+      final macToRules = <String, Map<String, dynamic>>{};
+      
       for (var rule in banRules) {
         final ip = rule['src-address']?.toString();
         final mac = rule['src-mac-address']?.toString();
         
+        // اگر IP وجود دارد، بر اساس IP گروه‌بندی کن
         if (ip != null && ip.isNotEmpty) {
           if (!ipToRules.containsKey(ip)) {
             ipToRules[ip] = {
@@ -776,76 +1062,225 @@ class MikroTikService {
           if (mac != null && ipToRules[ip]!['mac_address'] == null) {
             ipToRules[ip]!['mac_address'] = mac;
           }
+        } 
+        // اگر فقط MAC وجود دارد (بدون IP)، بر اساس MAC گروه‌بندی کن
+        else if (mac != null && mac.isNotEmpty) {
+          if (!macToRules.containsKey(mac)) {
+            macToRules[mac] = {
+              'address': null,
+              'mac_address': mac,
+              'chains': <String>[],
+              'rule_ids': <String>[],
+              'comment': rule['comment'] ?? '',
+            };
+          }
+          
+          final chain = rule['chain']?.toString();
+          if (chain != null && !macToRules[mac]!['chains'].contains(chain)) {
+            (macToRules[mac]!['chains'] as List).add(chain);
+          }
+          
+          final ruleId = rule['.id']?.toString();
+          if (ruleId != null && !macToRules[mac]!['rule_ids'].contains(ruleId)) {
+            (macToRules[mac]!['rule_ids'] as List).add(ruleId);
+          }
         }
       }
 
-      // تبدیل به لیست
-      final bannedClients = ipToRules.values.toList();
-
-      // افزودن اطلاعات DHCP و Wireless
-      for (var client in bannedClients) {
-        final ip = client['address'] as String;
-        final mac = client['mac_address'] as String?;
-
-        // پیدا کردن MAC از DHCP یا ARP اگر موجود نباشد
-        if (mac == null) {
-          try {
-            final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-            for (var lease in dhcpLeases) {
-              if (lease['address'] == ip) {
-                client['mac_address'] = lease['mac-address'];
-                break;
-              }
+      // تبدیل به لیست (اول IP-based، سپس MAC-only)
+      final bannedClients = <Map<String, dynamic>>[];
+      bannedClients.addAll(ipToRules.values);
+      
+      // برای MAC-only rules، سعی کن IP را از DHCP یا ARP پیدا کن
+      for (var macRule in macToRules.values) {
+        final mac = macRule['mac_address'] as String?;
+        if (mac != null) {
+          // بررسی اینکه آیا این MAC قبلاً در لیست IP-based اضافه شده
+          bool alreadyAdded = false;
+          for (var client in bannedClients) {
+            if (client['mac_address']?.toString().toUpperCase() == mac.toUpperCase()) {
+              alreadyAdded = true;
+              break;
             }
-            
-            if (client['mac_address'] == null) {
-              final arpEntries = await _client!.talk(['/ip/arp/print']);
-              for (var arp in arpEntries) {
-                if (arp['address'] == ip) {
-                  client['mac_address'] = arp['mac-address'];
+          }
+          
+          // اگر اضافه نشده، IP را از DHCP یا ARP پیدا کن
+          if (!alreadyAdded) {
+            String? foundIp;
+            try {
+              final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+              for (var lease in dhcpLeases) {
+                final leaseMac = lease['mac-address']?.toString().toUpperCase();
+                if (leaseMac == mac.toUpperCase()) {
+                  foundIp = lease['address'];
                   break;
                 }
               }
-            }
-          } catch (e) {
-            // ignore
-          }
-        }
-
-        // بررسی DHCP Block Access
-        if (client['mac_address'] != null) {
-          try {
-            final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-            for (var lease in dhcpLeases) {
-              final leaseMac = lease['mac-address']?.toString().toUpperCase();
-              if (leaseMac == (client['mac_address'] as String).toUpperCase()) {
-                client['dhcp_blocked'] = lease['block-access'] == 'yes';
-                break;
+              
+              if (foundIp == null) {
+                final arpEntries = await _client!.talk(['/ip/arp/print']);
+                for (var arp in arpEntries) {
+                  final arpMac = arp['mac-address']?.toString().toUpperCase();
+                  if (arpMac == mac.toUpperCase()) {
+                    foundIp = arp['address'];
+                    break;
+                  }
+                }
               }
+            } catch (e) {
+              // ignore
             }
-          } catch (e) {
-            // ignore
-          }
-        }
-
-        // بررسی Wireless Access List
-        if (client['mac_address'] != null) {
-          try {
-            final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
-            for (var acl in accessList) {
-              final aclMac = acl['mac-address']?.toString().toUpperCase();
-              if (aclMac == (client['mac_address'] as String).toUpperCase()) {
-                client['wireless_blocked'] = acl['action'] == 'reject' || acl['action'] == 'deny';
-                break;
-              }
-            }
-          } catch (e) {
-            // ignore
+            
+            macRule['address'] = foundIp;
+            bannedClients.add(macRule);
           }
         }
       }
 
-      return bannedClients;
+      // بررسی اینکه آیا IP/MAC واقعاً متصل هستند
+      // اگر IP/MAC در DHCP leases یا ARP table وجود نداشته باشد،
+      // یعنی دستگاه دیگر متصل نیست و نباید در لیست نشان داده شود
+      final actuallyConnectedBanned = <Map<String, dynamic>>[];
+      
+      // دریافت لیست دستگاه‌های واقعاً متصل
+      final dhcpLeases = <String, Map<String, dynamic>>{};
+      final arpEntries = <String, Map<String, dynamic>>{};
+      
+      try {
+        final leases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+        for (var lease in leases) {
+          final leaseIp = lease['address']?.toString();
+          final leaseMac = lease['mac-address']?.toString();
+          if (leaseIp != null) {
+            dhcpLeases[leaseIp] = lease;
+          }
+          if (leaseMac != null) {
+            dhcpLeases[leaseMac.toUpperCase()] = lease;
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+      
+      try {
+        final arps = await _client!.talk(['/ip/arp/print']);
+        for (var arp in arps) {
+          final arpIp = arp['address']?.toString();
+          final arpMac = arp['mac-address']?.toString();
+          if (arpIp != null) {
+            arpEntries[arpIp] = arp;
+          }
+          if (arpMac != null) {
+            arpEntries[arpMac.toUpperCase()] = arp;
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // افزودن اطلاعات DHCP و Wireless و بررسی اتصال واقعی
+      for (var client in bannedClients) {
+        final ip = client['address'] as String?;
+        final mac = client['mac_address'] as String?;
+        bool isActuallyConnected = false;
+
+        // بررسی اینکه آیا IP/MAC واقعاً متصل است
+        if (ip != null && ip.isNotEmpty) {
+          // بررسی در DHCP leases
+          if (dhcpLeases.containsKey(ip)) {
+            final lease = dhcpLeases[ip]!;
+            final leaseMac = lease['mac-address']?.toString();
+            
+            // اگر MAC در rule وجود دارد، باید با MAC در DHCP مطابقت داشته باشد
+            if (mac != null && mac.isNotEmpty) {
+              if (leaseMac?.toUpperCase() == mac.toUpperCase()) {
+                isActuallyConnected = true;
+                client['mac_address'] = leaseMac;
+              }
+            } else {
+              // اگر MAC در rule نیست، فقط IP کافی است
+              isActuallyConnected = true;
+              if (leaseMac != null) {
+                client['mac_address'] = leaseMac;
+              }
+            }
+          }
+          
+          // اگر در DHCP پیدا نشد، در ARP بررسی کن
+          if (!isActuallyConnected && arpEntries.containsKey(ip)) {
+            final arp = arpEntries[ip]!;
+            final arpMac = arp['mac-address']?.toString();
+            
+            if (mac != null && mac.isNotEmpty) {
+              if (arpMac?.toUpperCase() == mac.toUpperCase()) {
+                isActuallyConnected = true;
+                client['mac_address'] = arpMac;
+              }
+            } else {
+              isActuallyConnected = true;
+              if (arpMac != null) {
+                client['mac_address'] = arpMac;
+              }
+            }
+          }
+        } else if (mac != null && mac.isNotEmpty) {
+          // اگر فقط MAC داریم (بدون IP)، بررسی کن که آیا این MAC متصل است
+          final macUpper = mac.toUpperCase();
+          
+          // بررسی در DHCP leases
+          for (var lease in dhcpLeases.values) {
+            final leaseMac = lease['mac-address']?.toString().toUpperCase();
+            if (leaseMac == macUpper) {
+              isActuallyConnected = true;
+              client['address'] = lease['address'];
+              break;
+            }
+          }
+          
+          // بررسی در ARP
+          if (!isActuallyConnected) {
+            for (var arp in arpEntries.values) {
+              final arpMac = arp['mac-address']?.toString().toUpperCase();
+              if (arpMac == macUpper) {
+                isActuallyConnected = true;
+                client['address'] = arp['address'];
+                break;
+              }
+            }
+          }
+        }
+
+        // فقط اگر واقعاً متصل است، به لیست اضافه کن
+        if (isActuallyConnected) {
+          // بررسی DHCP Block Access
+          final finalMac = client['mac_address']?.toString();
+          if (finalMac != null) {
+            try {
+              // استفاده از dhcpLeases که قبلاً لود شده
+              if (dhcpLeases.containsKey(finalMac.toUpperCase())) {
+                final lease = dhcpLeases[finalMac.toUpperCase()]!;
+                client['dhcp_blocked'] = lease['block-access'] == 'yes';
+              }
+              
+              // بررسی Wireless Access List
+              final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+              for (var acl in accessList) {
+                final aclMac = acl['mac-address']?.toString().toUpperCase();
+                if (aclMac == finalMac.toUpperCase()) {
+                  client['wireless_blocked'] = acl['action'] == 'reject' || acl['action'] == 'deny';
+                  break;
+                }
+              }
+            } catch (e) {
+              // ignore
+            }
+          }
+          
+          actuallyConnectedBanned.add(client);
+        }
+      }
+
+      return actuallyConnectedBanned;
     } catch (e) {
       throw Exception('خطا در دریافت لیست مسدود شده‌ها: $e');
     }
@@ -932,6 +1367,41 @@ class MikroTikService {
         // ایجاد queue جدید
         await _client!.talk(['/queue/simple/add', '=target=$targetWithSubnet', '=max-limit=$maxLimitInBits']);
       }
+
+      // ایجاد Static IP برای شناسایی بهتر دستگاه در آینده
+      try {
+        // پیدا کردن MAC address از IP
+        String? macAddress;
+        final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+        for (var lease in dhcpLeases) {
+          if (lease['address'] == targetIp) {
+            macAddress = lease['mac-address'];
+            break;
+          }
+        }
+        
+        // اگر در DHCP پیدا نشد، در ARP table جستجو کن
+        if (macAddress == null) {
+          final arpEntries = await _client!.talk(['/ip/arp/print']);
+          for (var arp in arpEntries) {
+            if (arp['address'] == targetIp) {
+              macAddress = arp['mac-address'];
+              break;
+            }
+          }
+        }
+
+        if (macAddress != null) {
+          await _createOrUpdateStaticLease(
+            targetIp,
+            macAddress,
+            comment: 'Static IP - Speed Limited via Flutter App',
+          );
+        }
+      } catch (e) {
+        // ignore errors - Static IP optional است
+      }
+
       return true;
     } catch (e) {
       throw Exception('خطا در تنظیم سرعت: $e');
@@ -1025,21 +1495,1143 @@ class MikroTikService {
   }
 
   /// دریافت IP دستگاه کاربر
+  /// دریافت IP دستگاه کاربر
+  /// این تابع سعی می‌کند IP دستگاه کاربر را از طریق چند روش پیدا کند:
+  /// 1. استفاده از NetworkInterface برای دریافت IP محلی دستگاه
+  /// 2. مقایسه IP محلی با لیست IP های متصل در روتر
+  /// 3. استفاده از ARP table و DHCP leases
   Future<String?> getDeviceIp() async {
     if (_client == null || !isConnected) {
       return null;
     }
+    
     try {
-      // استفاده از ARP table برای پیدا کردن IP دستگاه
-      final arpEntries = await _client!.talk(['/ip/arp/print']);
-      if (arpEntries.isNotEmpty) {
-        // استفاده از IP اول به عنوان IP دستگاه
-        return arpEntries.first['address'];
+      // روش 1: استفاده از NetworkInterface برای دریافت IP محلی دستگاه
+      String? localDeviceIp;
+      try {
+        final interfaces = await NetworkInterface.list(
+          type: InternetAddressType.IPv4,
+          includeLinkLocal: false,
+        );
+        
+        for (var interface in interfaces) {
+          for (var addr in interface.addresses) {
+            if (!addr.isLoopback && addr.type == InternetAddressType.IPv4) {
+              final ip = addr.address;
+              // بررسی اینکه آیا IP در subnet محلی است (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+              final parts = ip.split('.');
+              if (parts.length == 4) {
+                final firstOctet = int.tryParse(parts[0]);
+                if (firstOctet != null) {
+                  if ((firstOctet == 192 && int.tryParse(parts[1]) == 168) ||
+                      firstOctet == 10 ||
+                      (firstOctet == 172 && 
+                       int.tryParse(parts[1]) != null && 
+                       int.tryParse(parts[1])! >= 16 && 
+                       int.tryParse(parts[1])! <= 31)) {
+                    localDeviceIp = ip;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          if (localDeviceIp != null) break;
+        }
+      } catch (e) {
+        // ignore - NetworkInterface ممکن است در برخی پلتفرم‌ها کار نکند
       }
+      
+      // اگر IP محلی پیدا شد، بررسی می‌کنیم که آیا در روتر هم وجود دارد
+      if (localDeviceIp != null) {
+        try {
+          // بررسی در ARP table
+          final arpEntries = await _client!.talk(['/ip/arp/print']);
+          for (var arp in arpEntries) {
+            if (arp['address']?.toString() == localDeviceIp) {
+              return localDeviceIp;
+            }
+          }
+          
+          // بررسی در DHCP leases
+          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+          for (var lease in dhcpLeases) {
+            if (lease['address']?.toString() == localDeviceIp) {
+              return localDeviceIp;
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+      
+      // روش 2: استفاده از IP روتر برای پیدا کردن subnet و سپس پیدا کردن IP دستگاه
+      String? routerIp = _connection?.host;
+      if (routerIp != null) {
+        try {
+          final routerParts = routerIp.split('.');
+          if (routerParts.length == 4) {
+            final subnetPrefix = '${routerParts[0]}.${routerParts[1]}.${routerParts[2]}.';
+            
+            // اگر IP محلی در همان subnet است، از آن استفاده می‌کنیم
+            if (localDeviceIp != null && localDeviceIp.startsWith(subnetPrefix)) {
+              return localDeviceIp;
+            }
+            
+            // پیدا کردن IP در ARP table که در همان subnet است
+            final arpEntries = await _client!.talk(['/ip/arp/print']);
+            for (var arp in arpEntries) {
+              final arpIp = arp['address']?.toString();
+              if (arpIp != null && 
+                  arpIp.startsWith(subnetPrefix) && 
+                  arpIp != routerIp &&
+                  arp['dynamic']?.toString().toLowerCase() == 'true') {
+                // بررسی در DHCP lease
+                try {
+                  final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+                  for (var lease in dhcpLeases) {
+                    if (lease['address']?.toString() == arpIp &&
+                        lease['status']?.toString().toLowerCase() == 'bound') {
+                      return arpIp;
+                    }
+                  }
+                } catch (e) {
+                  // ignore
+                }
+                
+                return arpIp;
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+      
+      // روش 3: استفاده از DHCP leases (fallback)
+      try {
+        final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+        // پیدا کردن اولین lease که bound است
+        for (var lease in dhcpLeases) {
+          final leaseIp = lease['address']?.toString();
+          if (leaseIp != null && 
+              lease['status']?.toString().toLowerCase() == 'bound') {
+            return leaseIp;
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+      
+      // روش 4: استفاده از ARP table (fallback)
+      try {
+        final arpEntries = await _client!.talk(['/ip/arp/print']);
+        if (arpEntries.isNotEmpty) {
+          // پیدا کردن اولین IP که dynamic است
+          for (var arp in arpEntries) {
+            final arpIp = arp['address']?.toString();
+            if (arpIp != null && 
+                arpIp != routerIp &&
+                arp['dynamic']?.toString().toLowerCase() == 'true') {
+              return arpIp;
+            }
+          }
+          
+          // اگر dynamic پیدا نشد، اولین IP را برمی‌گردانیم
+          return arpEntries.first['address'];
+        }
+      } catch (e) {
+        // ignore
+      }
+      
       return null;
     } catch (e) {
       return null;
     }
+  }
+
+  /// بررسی و مسدود کردن خودکار دستگاه‌های متصل که Device Fingerprint آن‌ها مسدود شده است
+  /// 
+  /// این تابع لیست دستگاه‌های متصل را بررسی می‌کند و اگر Device Fingerprint
+  /// آن‌ها با لیست مسدود شده‌ها مطابقت داشته باشد، به صورت خودکار مسدود می‌کند.
+  /// 
+  /// این برای حالتی است که دستگاه با IP/MAC جدید متصل شده اما hostname
+  /// یا سایر ویژگی‌های آن تغییر نکرده است.
+  Future<List<Map<String, dynamic>>> checkAndBanBannedDevices() async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    try {
+      final fingerprintService = DeviceFingerprintService();
+      final bannedFingerprints = await fingerprintService.getBannedFingerprints();
+      
+      if (bannedFingerprints.isEmpty) {
+        return [];
+      }
+
+      // دریافت لیست دستگاه‌های متصل
+      final connectedResult = await getConnectedClients();
+      final connectedClients = (connectedResult['clients'] as List)
+          .map((c) => ClientInfo.fromMap(c as Map<String, dynamic>))
+          .toList();
+
+      final newlyBanned = <Map<String, dynamic>>[];
+
+      // دریافت همه rule های firewall فعلی (یک بار برای همه دستگاه‌ها)
+      final existingRules = <String, Map<String, dynamic>>{};
+      try {
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (var rule in rawRules) {
+          final ruleIp = rule['src-address']?.toString();
+          final ruleMac = rule['src-mac-address']?.toString();
+          final ruleId = rule['.id']?.toString();
+          
+          if (ruleId != null && 
+              rule['action'] == 'drop' && 
+              rule['chain'] == 'prerouting') {
+            // ذخیره rule بر اساس IP
+            if (ruleIp != null && ruleIp.isNotEmpty) {
+              existingRules['ip:$ruleIp'] = rule;
+            }
+            // ذخیره rule بر اساس MAC
+            if (ruleMac != null && ruleMac.isNotEmpty) {
+              existingRules['mac:${ruleMac.toUpperCase()}'] = rule;
+            }
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // بررسی هر دستگاه متصل
+      for (var client in connectedClients) {
+        // ایجاد Device Fingerprint از ClientInfo
+        final clientFingerprint = DeviceFingerprint.fromClientInfo(
+          client.ipAddress,
+          client.macAddress,
+          client.hostName,
+          client.ssid,
+        );
+
+        // بررسی با لیست مسدود شده‌ها
+        // بررسی دو طرفه: clientFingerprint.matches(bannedFingerprint) یا bannedFingerprint.matches(clientFingerprint)
+        for (var bannedFingerprint in bannedFingerprints) {
+          // بررسی دو طرفه برای اطمینان از تطابق کامل
+          bool isMatch = clientFingerprint.matches(bannedFingerprint) || 
+                        bannedFingerprint.matches(clientFingerprint);
+          
+          if (isMatch) {
+            // این دستگاه باید مسدود شود
+            if (client.ipAddress != null) {
+              try {
+                // بررسی اینکه آیا دستگاه قبلاً مسدود شده است
+                bool alreadyBanned = false;
+                
+                // بررسی rule های موجود بر اساس IP
+                if (client.ipAddress != null) {
+                  final ipRule = existingRules['ip:${client.ipAddress}'];
+                  if (ipRule != null) {
+                    final ruleComment = ipRule['comment']?.toString() ?? '';
+                    // اگر comment مربوط به این Device Fingerprint است، قبلاً ban شده
+                    if (ruleComment.contains('Auto-banned:') && 
+                        ruleComment.contains(bannedFingerprint.fingerprintId)) {
+                      alreadyBanned = true;
+                    }
+                  }
+                }
+                
+                // بررسی rule های موجود بر اساس MAC
+                if (!alreadyBanned && client.macAddress != null) {
+                  final macRule = existingRules['mac:${client.macAddress!.toUpperCase()}'];
+                  if (macRule != null) {
+                    final ruleComment = macRule['comment']?.toString() ?? '';
+                    // اگر comment مربوط به این Device Fingerprint است، قبلاً ban شده
+                    if (ruleComment.contains('Auto-banned:') && 
+                        ruleComment.contains(bannedFingerprint.fingerprintId)) {
+                      alreadyBanned = true;
+                    }
+                  }
+                }
+                
+                // اگر قبلاً مسدود نشده، مسدود کن
+                if (!alreadyBanned) {
+                  await banClient(
+                    client.ipAddress!,
+                    macAddress: client.macAddress,
+                    comment: 'Auto-banned: ${bannedFingerprint.fingerprintId}',
+                  );
+
+                  newlyBanned.add({
+                    'ip_address': client.ipAddress,
+                    'mac_address': client.macAddress,
+                    'hostname': client.hostName,
+                    'device_type': clientFingerprint.deviceType,
+                    'fingerprint_id': clientFingerprint.fingerprintId,
+                    'banned_fingerprint_id': bannedFingerprint.fingerprintId,
+                  });
+                }
+              } catch (e) {
+                // ignore errors
+              }
+            }
+            break; // اگر پیدا شد، دیگر نیازی به بررسی بقیه نیست
+          }
+        }
+      }
+
+      return newlyBanned;
+    } catch (e) {
+      throw Exception('خطا در بررسی و مسدود کردن دستگاه‌ها: $e');
+    }
+  }
+
+  /// دریافت اطلاعات کامل روتر
+  /// مشابه POST /api/connect/test در پروژه Python
+  /// این اطلاعات شامل uptime, version, board-name, platform, CPU, Memory و ... است
+  Future<Map<String, dynamic>> getRouterInfo() async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    try {
+      // دریافت اطلاعات از /system/resource/print (همه اطلاعات در یک جا)
+      final resource = await _client!.talk(['/system/resource/print']);
+      
+      if (resource.isEmpty) {
+        throw Exception('اطلاعات روتر یافت نشد');
+      }
+
+      final resourceData = resource[0];
+      
+      // دریافت board-name از /system/routerboard/print (اگر موجود باشد)
+      String? boardName;
+      try {
+        final routerboard = await _client!.talk(['/system/routerboard/print']);
+        if (routerboard.isNotEmpty) {
+          boardName = routerboard[0]['board-name']?.toString();
+        }
+      } catch (e) {
+        // ignore - board-name optional است
+      }
+
+      // ساخت Map با تمام اطلاعات
+      final routerInfo = <String, dynamic>{
+        'uptime': resourceData['uptime']?.toString() ?? 'Unknown',
+        'version': resourceData['version']?.toString() ?? 'Unknown',
+        'build-time': resourceData['build-time']?.toString() ?? 'Unknown',
+        'factory-software': resourceData['factory-software']?.toString() ?? 'Unknown',
+        'free-memory': resourceData['free-memory']?.toString() ?? '0',
+        'total-memory': resourceData['total-memory']?.toString() ?? '0',
+        'cpu': resourceData['cpu']?.toString() ?? 'Unknown',
+        'cpu-count': resourceData['cpu-count']?.toString() ?? '0',
+        'cpu-frequency': resourceData['cpu-frequency']?.toString() ?? '0',
+        'cpu-load': resourceData['cpu-load']?.toString() ?? '0',
+        'free-hdd-space': resourceData['free-hdd-space']?.toString() ?? '0',
+        'total-hdd-space': resourceData['total-hdd-space']?.toString() ?? '0',
+        'write-sect-since-reboot': resourceData['write-sect-since-reboot']?.toString() ?? '0',
+        'write-sect-total': resourceData['write-sect-total']?.toString() ?? '0',
+        'bad-blocks': resourceData['bad-blocks']?.toString() ?? '0',
+        'architecture-name': resourceData['architecture-name']?.toString() ?? 'Unknown',
+        'board-name': boardName ?? resourceData['board-name']?.toString() ?? 'Unknown',
+        'platform': resourceData['platform']?.toString() ?? 'Unknown',
+      };
+
+      return routerInfo;
+    } catch (e) {
+      throw Exception('خطا در دریافت اطلاعات روتر: $e');
+    }
+  }
+
+  /// قفل کردن اتصال دستگاه‌های جدید
+  /// این تابع اتصال دستگاه‌های جدید را مسدود می‌کند اما دستگاه‌های قبلاً متصل شده کار می‌کنند
+  /// 
+  /// روش پیاده‌سازی:
+  /// 1. دریافت لیست MAC های فعلی متصل
+  /// 2. اضافه کردن MAC دستگاه کاربر به لیست مجاز (برای جلوگیری از مسدود شدن خود کاربر)
+  /// 3. برای Wireless: اضافه کردن MAC های مجاز به access list با action=allow
+  /// 4. برای LAN: ایجاد static leases برای همه و محدود کردن DHCP
+  /// 5. ایجاد Raw rule برای block کردن ترافیک MAC های غیرمجاز
+  Future<bool> lockNewConnections() async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    try {
+      // دریافت لیست MAC های فعلی متصل
+      final connectedMacs = <String>{};
+      
+      // از DHCP leases (bound)
+      try {
+        final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+        for (var lease in dhcpLeases) {
+          if (lease['status']?.toString().toLowerCase() == 'bound') {
+            final mac = lease['mac-address']?.toString().toUpperCase();
+            if (mac != null && mac.isNotEmpty) {
+              connectedMacs.add(mac);
+            }
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // از Wireless registration table
+      try {
+        final wirelessClients = await _client!.talk(['/interface/wireless/registration-table/print']);
+        for (var client in wirelessClients) {
+          final mac = client['mac-address']?.toString().toUpperCase();
+          if (mac != null && mac.isNotEmpty) {
+            connectedMacs.add(mac);
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // از ARP table (برای دستگاه‌های LAN)
+      try {
+        final arpEntries = await _client!.talk(['/ip/arp/print']);
+        for (var arp in arpEntries) {
+          final mac = arp['mac-address']?.toString().toUpperCase();
+          if (mac != null && mac.isNotEmpty) {
+            connectedMacs.add(mac);
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // اضافه کردن MAC دستگاه کاربر به لیست مجاز (برای جلوگیری از مسدود شدن خود کاربر)
+      try {
+        final deviceIp = await getDeviceIp();
+        if (deviceIp != null) {
+          bool deviceMacFound = false;
+          
+          // پیدا کردن MAC دستگاه کاربر از DHCP lease
+          try {
+            final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+            for (var lease in dhcpLeases) {
+              if (lease['address']?.toString() == deviceIp) {
+                final mac = lease['mac-address']?.toString().toUpperCase();
+                if (mac != null && mac.isNotEmpty) {
+                  connectedMacs.add(mac);
+                  deviceMacFound = true;
+                }
+                break;
+              }
+            }
+          } catch (e) {
+            // ignore
+          }
+
+          // اگر در DHCP پیدا نشد، از ARP table استفاده کن
+          if (!deviceMacFound) {
+            try {
+              final arpEntries = await _client!.talk(['/ip/arp/print']);
+              for (var arp in arpEntries) {
+                if (arp['address']?.toString() == deviceIp) {
+                  final mac = arp['mac-address']?.toString().toUpperCase();
+                  if (mac != null && mac.isNotEmpty) {
+                    connectedMacs.add(mac);
+                    deviceMacFound = true;
+                  }
+                  break;
+                }
+              }
+            } catch (e) {
+              // ignore
+            }
+          }
+        }
+      } catch (e) {
+        // ignore - اگر نتوانستیم MAC دستگاه کاربر را پیدا کنیم، ادامه بده
+      }
+
+      // 1. برای Wireless: اضافه کردن MAC های مجاز به access list
+      try {
+        final wirelessInterfaces = await _client!.talk(['/interface/wireless/print']);
+        
+        for (var wifiInterface in wirelessInterfaces) {
+          final interfaceName = wifiInterface['name']?.toString();
+          if (interfaceName != null) {
+            // حذف rule های قبلی lock (اگر وجود دارد)
+            final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+            for (var acl in accessList) {
+              final comment = acl['comment']?.toString();
+              if (comment == 'Lock New Connections - Allowed Device') {
+                final aclId = acl['.id'];
+                if (aclId != null) {
+                  try {
+                    await _client!.talk([
+                      '/interface/wireless/access-list/remove',
+                      '=.id=$aclId',
+                    ]);
+                  } catch (e) {
+                    // ignore
+                  }
+                }
+              }
+            }
+
+            // اضافه کردن MAC های مجاز به access list با action=allow
+            for (var mac in connectedMacs) {
+              try {
+                // بررسی اینکه آیا قبلاً اضافه شده
+                bool exists = false;
+                final currentAccessList = await _client!.talk(['/interface/wireless/access-list/print']);
+                for (var acl in currentAccessList) {
+                  if (acl['mac-address']?.toString().toUpperCase() == mac &&
+                      acl['interface']?.toString() == interfaceName) {
+                    exists = true;
+                    // اگر action allow نیست، تغییر بده
+                    if (acl['action']?.toString() != 'allow') {
+                      final aclId = acl['.id'];
+                      if (aclId != null) {
+                        await _client!.talk([
+                          '/interface/wireless/access-list/set',
+                          '=.id=$aclId',
+                          '=action=allow',
+                          '=comment=Lock New Connections - Allowed Device',
+                        ]);
+                      }
+                    }
+                    break;
+                  }
+                }
+                
+                // اگر وجود ندارد، اضافه کن
+                if (!exists) {
+                  await _client!.talk([
+                    '/interface/wireless/access-list/add',
+                    '=interface=$interfaceName',
+                    '=mac-address=$mac',
+                    '=action=allow',
+                    '=comment=Lock New Connections - Allowed Device',
+                  ]);
+                }
+              } catch (e) {
+                // ignore errors for individual MACs
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ignore - wireless ممکن است فعال نباشد
+      }
+
+      // 2. برای LAN: ایجاد static leases برای همه MAC های فعلی
+      // و سپس ایجاد rule برای block کردن MAC های جدید
+      try {
+        final currentLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+        
+        // تبدیل همه bound leases به static
+        for (var lease in currentLeases) {
+          if (lease['status']?.toString().toLowerCase() == 'bound') {
+            final leaseId = lease['.id'];
+            if (leaseId != null) {
+              try {
+                // تبدیل به static lease
+                await _client!.talk([
+                  '/ip/dhcp-server/lease/make-static',
+                  '=.id=$leaseId',
+                ]);
+              } catch (e) {
+                // ignore - ممکن است قبلاً static باشد
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ignore - DHCP ممکن است فعال نباشد
+      }
+
+      // 3. ایجاد Raw rule برای block کردن ترافیک MAC های غیرمجاز
+      // این rule در chain=prerouting قرار می‌گیرد و قبل از connection tracking پردازش می‌شود
+      try {
+        // حذف rule های قبلی lock (اگر وجود دارد)
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (var rule in rawRules) {
+          final comment = rule['comment']?.toString();
+          if (comment == 'Lock New Connections - Block New MACs') {
+            final ruleId = rule['.id'];
+            if (ruleId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/raw/remove',
+                  '=.id=$ruleId',
+                ]);
+              } catch (e) {
+                // ignore
+              }
+            }
+          }
+        }
+
+        // ایجاد rule برای block کردن همه MAC های غیرمجاز
+        // اما MikroTik نمی‌تواند مستقیماً "همه MAC های غیرمجاز" را block کند
+        // پس از روش دیگری استفاده می‌کنیم:
+        
+        // ایجاد exception rules برای MAC های مجاز (قبل از rule block)
+        // و سپس یک rule کلی برای block کردن بقیه
+        // اما این پیچیده است
+        
+        // روش ساده‌تر: استفاده از یک marker و بررسی در loadClients
+        // و مسدود کردن خودکار دستگاه‌های جدید که MAC آن‌ها در لیست مجاز نیست
+      } catch (e) {
+        // ignore
+      }
+
+      // 4. دریافت و ذخیره IP های همه دستگاه‌های فعلی (شامل دستگاه کاربر) برای جلوگیری از مسدود شدن
+      final allowedIps = <String>{};
+      
+      // اضافه کردن IP دستگاه کاربر
+      try {
+        final deviceIp = await getDeviceIp();
+        if (deviceIp != null) {
+          allowedIps.add(deviceIp);
+        }
+      } catch (e) {
+        // ignore
+      }
+      
+      // اضافه کردن IP های همه دستگاه‌های فعلی از DHCP leases
+      try {
+        final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+        for (var lease in dhcpLeases) {
+          if (lease['status']?.toString().toLowerCase() == 'bound') {
+            final ip = lease['address']?.toString();
+            if (ip != null && ip.isNotEmpty) {
+              allowedIps.add(ip);
+            }
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+      
+      // اضافه کردن IP های همه دستگاه‌های فعلی از ARP table
+      try {
+        final arpEntries = await _client!.talk(['/ip/arp/print']);
+        for (var arp in arpEntries) {
+          final ip = arp['address']?.toString();
+          if (ip != null && ip.isNotEmpty) {
+            allowedIps.add(ip);
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+      
+      // اضافه کردن IP های همه دستگاه‌های فعلی از Wireless registration table
+      try {
+        final wirelessClients = await _client!.talk(['/interface/wireless/registration-table/print']);
+        for (var client in wirelessClients) {
+          final ip = client['last-ip']?.toString();
+          if (ip != null && ip.isNotEmpty) {
+            allowedIps.add(ip);
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // 5. ذخیره لیست MAC ها و IP های مجاز در SharedPreferences برای بررسی بعدی
+      // این برای بررسی در loadClients استفاده می‌شود
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        // ذخیره لیست MAC های مجاز
+        final allowedMacsList = connectedMacs.toList();
+        await prefs.setStringList('locked_allowed_macs', allowedMacsList);
+        
+        // ذخیره لیست IP های مجاز (شامل IP دستگاه کاربر)
+        final allowedIpsList = allowedIps.toList();
+        await prefs.setStringList('locked_allowed_ips', allowedIpsList);
+        
+        // ذخیره timestamp برای بررسی بعدی
+        await prefs.setInt('locked_timestamp', DateTime.now().millisecondsSinceEpoch);
+      } catch (e) {
+        // ignore - SharedPreferences optional است
+      }
+
+      // 6. آزاد کردن دستگاه‌هایی که به خاطر قفل قبلی مسدود شده‌اند
+      // فقط دستگاه‌هایی که comment آن‌ها دقیقاً "Auto-banned: New connection while locked" است
+      // دستگاه‌هایی که دستی مسدود شده‌اند (با comment "Banned:" یا "Banned via Flutter App") آزاد نمی‌شوند
+      // دستگاه‌هایی که به خاطر Device Fingerprint مسدود شده‌اند (با comment "Auto-banned: [fingerprint]") نیز آزاد نمی‌شوند
+      try {
+        // حذف rule های firewall که مربوط به قفل قبلی هستند
+        // حذف همه rule های auto-banned که مربوط به قفل هستند (با همه comment های ممکن)
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (var rule in rawRules) {
+          final ruleComment = rule['comment']?.toString() ?? '';
+          
+          // بررسی اینکه آیا comment مربوط به قفل است (نه Device Fingerprint یا مسدود دستی)
+          // comment های مربوط به قفل: "Auto-banned: New connection while locked" یا هر comment که شامل این متن باشد
+          // comment های مربوط به Device Fingerprint: "Auto-banned: [fingerprint]" یا "Banned: [fingerprint]"
+          // comment های مربوط به مسدود دستی: "Banned via Flutter App" یا "Banned: [fingerprint]"
+          bool isLockBan = ruleComment.contains('Auto-banned: New connection while locked') ||
+                          ruleComment.contains('New connection while locked');
+          
+          // بررسی اینکه آیا comment مربوط به Device Fingerprint یا مسدود دستی است
+          bool isManualBan = ruleComment.startsWith('Banned:') ||
+                           ruleComment.startsWith('Banned via Flutter App') ||
+                           (ruleComment.contains('fingerprint') && 
+                            !ruleComment.contains('New connection while locked'));
+          
+          // اگر مربوط به قفل است و نه Device Fingerprint یا مسدود دستی، حذف کن
+          if (isLockBan && !isManualBan &&
+              rule['action'] == 'drop' &&
+              rule['chain'] == 'prerouting') {
+            final ruleId = rule['.id'];
+            if (ruleId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/raw/remove',
+                  '=.id=$ruleId',
+                ]);
+              } catch (e) {
+                // ignore
+              }
+            }
+          }
+        }
+        
+        // رفع block از DHCP leases که به خاطر قفل block شده‌اند
+        // حذف block از همه leases که comment آن‌ها مربوط به قفل است
+        try {
+          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+          for (var lease in dhcpLeases) {
+            if (lease['block-access']?.toString().toLowerCase() == 'yes') {
+              final leaseComment = lease['comment']?.toString() ?? '';
+              
+              // بررسی اینکه آیا comment مربوط به قفل است
+              bool isLockBan = leaseComment.contains('Auto-banned: New connection while locked') ||
+                              leaseComment.contains('New connection while locked');
+              
+              // بررسی اینکه آیا comment مربوط به Device Fingerprint یا مسدود دستی است
+              bool isManualBan = leaseComment.startsWith('Banned:') ||
+                               leaseComment.startsWith('Banned via Flutter App') ||
+                               (leaseComment.contains('fingerprint') && 
+                                !leaseComment.contains('New connection while locked'));
+              
+              // اگر مربوط به قفل است و نه Device Fingerprint یا مسدود دستی، unblock کن
+              if (isLockBan && !isManualBan) {
+                final leaseId = lease['.id'];
+                if (leaseId != null) {
+                  try {
+                    await _client!.talk([
+                      '/ip/dhcp-server/lease/set',
+                      '=.id=$leaseId',
+                      '=block-access=no',
+                    ]);
+                  } catch (e) {
+                    // ignore
+                  }
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+        
+        // حذف rule های wireless که به خاطر قفل deny/reject شده‌اند
+        // حذف همه rule هایی که comment آن‌ها مربوط به قفل است
+        try {
+          final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+          for (var acl in accessList) {
+            final aclComment = acl['comment']?.toString() ?? '';
+            final aclAction = acl['action']?.toString();
+            
+            // اگر action deny یا reject است و comment مربوط به قفل است، حذف کن
+            // rule هایی که comment آن‌ها "Banned:" است را نگه دار (مسدود دستی)
+            if ((aclAction == 'deny' || aclAction == 'reject')) {
+              // بررسی اینکه آیا comment مربوط به قفل است
+              bool isLockBan = aclComment.contains('Auto-banned: New connection while locked') ||
+                              aclComment.contains('New connection while locked');
+              
+              // بررسی اینکه آیا comment مربوط به Device Fingerprint یا مسدود دستی است
+              bool isManualBan = aclComment.startsWith('Banned:') ||
+                               aclComment.startsWith('Banned via Flutter App') ||
+                               (aclComment.contains('fingerprint') && 
+                                !aclComment.contains('New connection while locked'));
+              
+              // اگر مربوط به قفل است و نه Device Fingerprint یا مسدود دستی، حذف کن
+              if (isLockBan && !isManualBan) {
+                final aclId = acl['.id'];
+                if (aclId != null) {
+                  try {
+                    await _client!.talk([
+                      '/interface/wireless/access-list/remove',
+                      '=.id=$aclId',
+                    ]);
+                  } catch (e) {
+                    // ignore
+                  }
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      } catch (e) {
+        // ignore
+      }
+      
+      // 7. حذف rule های firewall که IP دستگاه‌های فعلی (شامل دستگاه کاربر) را مسدود می‌کنند
+      // این برای اطمینان از اینکه IP دستگاه‌های فعلی مسدود نشده‌اند
+      // اما فقط rule هایی که مربوط به قفل هستند (نه مسدود دستی)
+      try {
+        // بررسی و حذف rule های firewall که IP دستگاه‌های فعلی را مسدود می‌کنند
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (var rule in rawRules) {
+          final ruleIp = rule['src-address']?.toString();
+          final ruleComment = rule['comment']?.toString();
+          
+          // اگر rule مربوط به IP یکی از دستگاه‌های فعلی است و comment مربوط به lock است، حذف کن
+          // rule هایی که comment آن‌ها "Banned:" یا "Banned via Flutter App" است را نگه دار
+          if (ruleIp != null && 
+              allowedIps.contains(ruleIp) &&
+              ruleComment != null) {
+            // بررسی اینکه آیا comment مربوط به قفل است
+            bool isLockBan = ruleComment == 'Auto-banned: New connection while locked' ||
+                            ruleComment == 'Auto-banned: New connection while locked - IP' ||
+                            ruleComment == 'Auto-banned: New connection while locked - MAC';
+            
+            // اگر مربوط به قفل است و نه Device Fingerprint یا مسدود دستی، حذف کن
+            if (isLockBan && 
+                !ruleComment.startsWith('Banned:') &&
+                !ruleComment.startsWith('Banned via Flutter App') &&
+                !ruleComment.contains('fingerprint')) {
+              final ruleId = rule['.id'];
+              if (ruleId != null) {
+                try {
+                  await _client!.talk([
+                    '/ip/firewall/raw/remove',
+                    '=.id=$ruleId',
+                  ]);
+                } catch (e) {
+                  // ignore
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // 8. ذخیره marker در system identity
+      try {
+        // استفاده از system identity برای ذخیره marker
+        final identity = await _client!.talk(['/system/identity/print']);
+        if (identity.isNotEmpty) {
+          final currentName = identity[0]['name']?.toString() ?? '';
+          // اضافه کردن marker به identity (اگر وجود ندارد)
+          if (!currentName.contains('[LOCKED_NEW_CONN]')) {
+            final originalName = currentName.replaceAll(' [LOCKED_NEW_CONN]', '');
+            await _client!.talk([
+              '/system/identity/set',
+              '=name=$originalName [LOCKED_NEW_CONN]',
+            ]);
+          }
+        }
+      } catch (e) {
+        // ignore - marker optional است
+      }
+
+      return true;
+    } catch (e) {
+      throw Exception('خطا در قفل کردن اتصال جدید: $e');
+    }
+  }
+
+  /// رفع قفل اتصال دستگاه‌های جدید
+  Future<bool> unlockNewConnections() async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    try {
+      // 1. حذف rule های wireless access list مربوط به lock
+      try {
+        final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+        for (var acl in accessList) {
+          final comment = acl['comment']?.toString();
+          if (comment == 'Lock New Connections - Allowed Device') {
+            final aclId = acl['.id'];
+            if (aclId != null) {
+              try {
+                await _client!.talk([
+                  '/interface/wireless/access-list/remove',
+                  '=.id=$aclId',
+                ]);
+              } catch (e) {
+                // ignore
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // 2. حذف Raw rules مربوط به lock
+      try {
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (var rule in rawRules) {
+          final comment = rule['comment']?.toString();
+          if (comment == 'Lock New Connections - Block New MACs') {
+            final ruleId = rule['.id'];
+            if (ruleId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/raw/remove',
+                  '=.id=$ruleId',
+                ]);
+              } catch (e) {
+                // ignore
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // 3. پاک کردن لیست MAC ها و IP های مجاز از SharedPreferences
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('locked_allowed_macs');
+        await prefs.remove('locked_allowed_ips');
+        await prefs.remove('locked_timestamp');
+      } catch (e) {
+        // ignore
+      }
+
+      // 4. بازگرداندن system identity به حالت عادی
+      try {
+        final identity = await _client!.talk(['/system/identity/print']);
+        if (identity.isNotEmpty) {
+          final currentName = identity[0]['name']?.toString() ?? '';
+          if (currentName.contains('[LOCKED_NEW_CONN]')) {
+            final originalName = currentName.replaceAll(' [LOCKED_NEW_CONN]', '');
+            await _client!.talk([
+              '/system/identity/set',
+              '=name=$originalName',
+            ]);
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // 5. رفع مسدودیت خودکار دستگاه‌هایی که به خاطر قفل مسدود شده‌اند
+      // حذف همه rule های auto-banned که مربوط به قفل هستند (با همه comment های ممکن)
+      // دستگاه‌هایی که دستی مسدود شده‌اند (با comment "Banned:" یا "Banned via Flutter App") آزاد نمی‌شوند
+      // دستگاه‌هایی که به خاطر Device Fingerprint مسدود شده‌اند (با comment "Auto-banned: [fingerprint]") نیز آزاد نمی‌شوند
+      try {
+        // حذف rule های firewall که مربوط به قفل هستند
+        final rawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (var rule in rawRules) {
+          final ruleComment = rule['comment']?.toString() ?? '';
+          
+          // بررسی اینکه آیا comment مربوط به قفل است (نه Device Fingerprint یا مسدود دستی)
+          // comment های مربوط به قفل: "Auto-banned: New connection while locked" یا هر comment که شامل این متن باشد
+          // comment های مربوط به Device Fingerprint: "Auto-banned: [fingerprint]" یا "Banned: [fingerprint]"
+          // comment های مربوط به مسدود دستی: "Banned via Flutter App" یا "Banned: [fingerprint]"
+          bool isLockBan = ruleComment.contains('Auto-banned: New connection while locked') ||
+                          ruleComment.contains('New connection while locked');
+          
+          // بررسی اینکه آیا comment مربوط به Device Fingerprint یا مسدود دستی است
+          bool isManualBan = ruleComment.startsWith('Banned:') ||
+                           ruleComment.startsWith('Banned via Flutter App') ||
+                           (ruleComment.contains('fingerprint') && 
+                            !ruleComment.contains('New connection while locked'));
+          
+          // اگر مربوط به قفل است و نه Device Fingerprint یا مسدود دستی، حذف کن
+          if (isLockBan && !isManualBan &&
+              rule['action'] == 'drop' &&
+              rule['chain'] == 'prerouting') {
+            final ruleId = rule['.id'];
+            if (ruleId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/raw/remove',
+                  '=.id=$ruleId',
+                ]);
+              } catch (e) {
+                // ignore
+              }
+            }
+          }
+        }
+        
+        // رفع block از DHCP leases که به خاطر قفل block شده‌اند
+        // حذف block از همه leases که comment آن‌ها مربوط به قفل است
+        try {
+          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+          for (var lease in dhcpLeases) {
+            if (lease['block-access']?.toString().toLowerCase() == 'yes') {
+              final leaseComment = lease['comment']?.toString() ?? '';
+              
+              // بررسی اینکه آیا comment مربوط به قفل است
+              bool isLockBan = leaseComment.contains('Auto-banned: New connection while locked') ||
+                              leaseComment.contains('New connection while locked');
+              
+              // بررسی اینکه آیا comment مربوط به Device Fingerprint یا مسدود دستی است
+              bool isManualBan = leaseComment.startsWith('Banned:') ||
+                               leaseComment.startsWith('Banned via Flutter App') ||
+                               (leaseComment.contains('fingerprint') && 
+                                !leaseComment.contains('New connection while locked'));
+              
+              // اگر مربوط به قفل است و نه Device Fingerprint یا مسدود دستی، unblock کن
+              if (isLockBan && !isManualBan) {
+                final leaseId = lease['.id'];
+                if (leaseId != null) {
+                  try {
+                    await _client!.talk([
+                      '/ip/dhcp-server/lease/set',
+                      '=.id=$leaseId',
+                      '=block-access=no',
+                    ]);
+                  } catch (e) {
+                    // ignore
+                  }
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+        
+        // حذف rule های wireless که به خاطر قفل deny/reject شده‌اند
+        // حذف همه rule هایی که comment آن‌ها مربوط به قفل است
+        try {
+          final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+          for (var acl in accessList) {
+            final aclComment = acl['comment']?.toString() ?? '';
+            final aclAction = acl['action']?.toString();
+            
+            // اگر action deny یا reject است و comment مربوط به قفل است، حذف کن
+            // rule هایی که comment آن‌ها "Banned:" است را نگه دار (مسدود دستی)
+            if ((aclAction == 'deny' || aclAction == 'reject')) {
+              // بررسی اینکه آیا comment مربوط به قفل است
+              bool isLockBan = aclComment.contains('Auto-banned: New connection while locked') ||
+                              aclComment.contains('New connection while locked');
+              
+              // بررسی اینکه آیا comment مربوط به Device Fingerprint یا مسدود دستی است
+              bool isManualBan = aclComment.startsWith('Banned:') ||
+                               aclComment.startsWith('Banned via Flutter App') ||
+                               (aclComment.contains('fingerprint') && 
+                                !aclComment.contains('New connection while locked'));
+              
+              // اگر مربوط به قفل است و نه Device Fingerprint یا مسدود دستی، حذف کن
+              if (isLockBan && !isManualBan) {
+                final aclId = acl['.id'];
+                if (aclId != null) {
+                  try {
+                    await _client!.talk([
+                      '/interface/wireless/access-list/remove',
+                      '=.id=$aclId',
+                    ]);
+                  } catch (e) {
+                    // ignore
+                  }
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      return true;
+    } catch (e) {
+      throw Exception('خطا در رفع قفل اتصال جدید: $e');
+    }
+  }
+
+  /// بررسی وضعیت قفل اتصال جدید
+  Future<bool> isNewConnectionsLocked() async {
+    if (_client == null || !isConnected) {
+      return false;
+    }
+
+    try {
+      // بررسی marker در system identity
+      final identity = await _client!.talk(['/system/identity/print']);
+      if (identity.isNotEmpty) {
+        final currentName = identity[0]['name']?.toString() ?? '';
+        if (currentName.contains('[LOCKED_NEW_CONN]')) {
+          return true;
+        }
+      }
+
+      // بررسی وجود rule های lock در wireless access list
+      final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+      for (var acl in accessList) {
+        final comment = acl['comment']?.toString();
+        if (comment == 'Lock New Connections - Allowed Device') {
+          return true;
+        }
+      }
+
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// دریافت لیست MAC های مجاز برای قفل (از SharedPreferences)
+  /// این لیست MAC های دستگاه‌هایی است که در زمان فعال شدن قفل متصل بودند
+  Future<Set<String>> getAllowedMacsForLock() async {
+    final allowedMacs = <String>{};
+    
+    try {
+      // دریافت از SharedPreferences (لیست اولیه در زمان فعال شدن قفل)
+      final prefs = await SharedPreferences.getInstance();
+      final allowedMacsList = prefs.getStringList('locked_allowed_macs');
+      if (allowedMacsList != null) {
+        for (var mac in allowedMacsList) {
+          if (mac.isNotEmpty) {
+            allowedMacs.add(mac.toUpperCase());
+          }
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    return allowedMacs;
+  }
+
+  /// دریافت لیست IP های مجاز برای قفل (از SharedPreferences)
+  /// این لیست IP های دستگاه‌هایی است که در زمان فعال شدن قفل متصل بودند (شامل IP دستگاه کاربر)
+  Future<Set<String>> getAllowedIpsForLock() async {
+    final allowedIps = <String>{};
+    
+    try {
+      // دریافت از SharedPreferences (لیست اولیه در زمان فعال شدن قفل)
+      final prefs = await SharedPreferences.getInstance();
+      final allowedIpsList = prefs.getStringList('locked_allowed_ips');
+      if (allowedIpsList != null) {
+        for (var ip in allowedIpsList) {
+          if (ip.isNotEmpty) {
+            allowedIps.add(ip);
+          }
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    return allowedIps;
   }
 
   /// بررسی IP
@@ -1089,6 +2681,61 @@ class MikroTikService {
       return result;
     } catch (e) {
       throw Exception('خطا در بررسی IP: $e');
+    }
+  }
+
+  /// ایجاد یا به‌روزرسانی Static IP Lease
+  /// این تابع یک Static DHCP lease ایجاد می‌کند تا دستگاه همیشه همان IP را بگیرد
+  /// این برای شناسایی بهتر دستگاه در آینده مفید است
+  Future<void> _createOrUpdateStaticLease(
+    String ipAddress,
+    String macAddress, {
+    String? hostname,
+    String? comment,
+  }) async {
+    if (_client == null || !isConnected) {
+      return;
+    }
+
+    try {
+      // بررسی اینکه آیا Static lease قبلاً وجود دارد
+      final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+      String? existingLeaseId;
+      
+      for (var lease in dhcpLeases) {
+        final leaseMac = lease['mac-address']?.toString().toUpperCase();
+        final leaseIp = lease['address']?.toString();
+        
+        // اگر MAC یا IP مطابقت دارد
+        if (leaseMac == macAddress.toUpperCase() || leaseIp == ipAddress) {
+          existingLeaseId = lease['.id'];
+          break;
+        }
+      }
+
+      final staticComment = comment ?? 'Static IP via Flutter App';
+      final leaseCommand = <String>[
+        '=address=$ipAddress',
+        '=mac-address=$macAddress',
+        '=comment=$staticComment',
+      ];
+
+      if (hostname != null && hostname.isNotEmpty) {
+        leaseCommand.add('=host-name=$hostname');
+      }
+
+      if (existingLeaseId != null) {
+        // به‌روزرسانی lease موجود
+        leaseCommand.insert(0, '/ip/dhcp-server/lease/set');
+        leaseCommand.insert(1, '=.id=$existingLeaseId');
+        await _client!.talk(leaseCommand);
+      } else {
+        // ایجاد lease جدید
+        leaseCommand.insert(0, '/ip/dhcp-server/lease/add');
+        await _client!.talk(leaseCommand);
+      }
+    } catch (e) {
+      // ignore errors - Static IP optional است
     }
   }
 }

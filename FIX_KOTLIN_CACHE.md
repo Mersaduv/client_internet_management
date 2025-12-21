@@ -61,3 +61,4 @@ flutter run
 3. بررسی اینکه هیچ فایل lock شده‌ای در build folder وجود نداشته باشد
 
 
+

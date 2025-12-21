@@ -255,12 +255,35 @@ class _HomePageState extends State<HomePage> {
                           size: 20,
                         ),
                         const SizedBox(width: 8),
-                        Text(
-                          '${connection.host}:${connection.port}',
-                          style: const TextStyle(
-                            color: Colors.black87,
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                provider.routerInfo?['board-name'] != null && 
+                                provider.routerInfo!['board-name'] != 'Unknown'
+                                    ? provider.routerInfo!['board-name']!
+                                    : '${connection.host}:${connection.port}',
+                                style: const TextStyle(
+                                  color: Colors.black87,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              if (provider.routerInfo?['board-name'] != null && 
+                                  provider.routerInfo!['board-name'] != 'Unknown' &&
+                                  provider.routerInfo?['platform'] != null &&
+                                  provider.routerInfo!['platform'] != 'Unknown') ...[
+                                const SizedBox(height: 2),
+                                Text(
+                                  provider.routerInfo!['platform']!,
+                                  style: TextStyle(
+                                    color: Colors.grey.shade600,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
                         ),
                         if (connection.useSsl) ...[
@@ -312,6 +335,161 @@ class _HomePageState extends State<HomePage> {
             Expanded(
               child: Column(
                 children: [
+                  // دکمه قفل اتصال جدید
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    color: Colors.white,
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: provider.isLoading
+                                ? null
+                                : () async {
+                                    if (provider.isNewConnectionsLocked) {
+                                      // رفع قفل
+                                      final confirmed = await showDialog<bool>(
+                                        context: context,
+                                        builder: (context) => AlertDialog(
+                                          title: const Text('رفع قفل اتصال جدید'),
+                                          content: const Text(
+                                            'آیا مطمئن هستید که می‌خواهید قفل اتصال جدید را بردارید؟\n'
+                                            'بعد از رفع قفل، دستگاه‌های جدید می‌توانند به شبکه متصل شوند.',
+                                          ),
+                                          actions: [
+                                            TextButton(
+                                              onPressed: () => Navigator.pop(context, false),
+                                              child: const Text('لغو'),
+                                            ),
+                                            ElevatedButton(
+                                              onPressed: () => Navigator.pop(context, true),
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: Colors.green,
+                                                foregroundColor: Colors.white,
+                                              ),
+                                              child: const Text('رفع قفل'),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+
+                                      if (confirmed == true) {
+                                        final success = await provider.unlockNewConnections();
+                                        if (mounted) {
+                                          ScaffoldMessenger.of(context).showSnackBar(
+                                            SnackBar(
+                                              content: Row(
+                                                children: [
+                                                  Icon(
+                                                    success ? Icons.check_circle : Icons.error,
+                                                    color: Colors.white,
+                                                  ),
+                                                  const SizedBox(width: 8),
+                                                  Expanded(
+                                                    child: Text(
+                                                      success
+                                                          ? 'قفل اتصال جدید با موفقیت برداشته شد'
+                                                          : 'خطا در رفع قفل: ${provider.errorMessage ?? "خطا"}',
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              backgroundColor: success ? Colors.green : Colors.red,
+                                              behavior: SnackBarBehavior.floating,
+                                            ),
+                                          );
+                                        }
+                                      }
+                                    } else {
+                                      // فعال کردن قفل
+                                      final confirmed = await showDialog<bool>(
+                                        context: context,
+                                        builder: (context) => AlertDialog(
+                                          title: const Text('قفل اتصال جدید'),
+                                          content: const Text(
+                                            'آیا مطمئن هستید که می‌خواهید اتصال دستگاه‌های جدید را قفل کنید؟\n\n'
+                                            'بعد از فعال‌سازی:\n'
+                                            '• دستگاه‌های فعلی همچنان کار می‌کنند\n'
+                                            '• هیچ دستگاه جدیدی نمی‌تواند به وای‌فای یا LAN متصل شود\n'
+                                            '• دستگاه‌های جدید به صورت خودکار مسدود می‌شوند',
+                                          ),
+                                          actions: [
+                                            TextButton(
+                                              onPressed: () => Navigator.pop(context, false),
+                                              child: const Text('لغو'),
+                                            ),
+                                            ElevatedButton(
+                                              onPressed: () => Navigator.pop(context, true),
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: Colors.orange,
+                                                foregroundColor: Colors.white,
+                                              ),
+                                              child: const Text('قفل کردن'),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+
+                                      if (confirmed == true) {
+                                        final success = await provider.lockNewConnections();
+                                        if (mounted) {
+                                          ScaffoldMessenger.of(context).showSnackBar(
+                                            SnackBar(
+                                              content: Row(
+                                                children: [
+                                                  Icon(
+                                                    success ? Icons.check_circle : Icons.error,
+                                                    color: Colors.white,
+                                                  ),
+                                                  const SizedBox(width: 8),
+                                                  Expanded(
+                                                    child: Text(
+                                                      success
+                                                          ? 'قفل اتصال جدید با موفقیت فعال شد'
+                                                          : 'خطا در قفل کردن: ${provider.errorMessage ?? "خطا"}',
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              backgroundColor: success ? Colors.orange : Colors.red,
+                                              behavior: SnackBarBehavior.floating,
+                                            ),
+                                          );
+                                        }
+                                      }
+                                    }
+                                  },
+                            icon: Icon(
+                              provider.isNewConnectionsLocked
+                                  ? Icons.lock
+                                  : Icons.lock_open,
+                              size: 20,
+                            ),
+                            label: Text(
+                              provider.isNewConnectionsLocked
+                                  ? 'قفل اتصال جدید (فعال)'
+                                  : 'قفل اتصال جدید',
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: provider.isNewConnectionsLocked
+                                  ? Colors.orange
+                                  : Colors.grey.shade300,
+                              foregroundColor: provider.isNewConnectionsLocked
+                                  ? Colors.white
+                                  : Colors.black87,
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
                   // Tab Bar
                   Container(
                     width: double.infinity,
@@ -633,10 +811,118 @@ class _HomePageState extends State<HomePage> {
                           color: Colors.grey.shade500,
                         ),
                       ),
+                    // نمایش نوع مسدودیت (Auto-banned یا Manual)
+                    if (banned['comment'] != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Row(
+                          children: [
+                            Icon(
+                              banned['comment'].toString().contains('Auto-banned: New connection while locked')
+                                  ? Icons.auto_fix_high
+                                  : Icons.block,
+                              size: 14,
+                              color: banned['comment'].toString().contains('Auto-banned: New connection while locked')
+                                  ? Colors.orange
+                                  : Colors.red,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              banned['comment'].toString().contains('Auto-banned: New connection while locked')
+                                  ? 'مسدود خودکار (قفل اتصال جدید)'
+                                  : 'مسدود دستی',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: banned['comment'].toString().contains('Auto-banned: New connection while locked')
+                                    ? Colors.orange.shade700
+                                    : Colors.red.shade700,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                   ],
                 ),
               ),
               const SizedBox(width: 8),
+              // دکمه رفع مسدودیت سریع
+              IconButton(
+                icon: const Icon(Icons.lock_open, color: Colors.green),
+                tooltip: 'رفع مسدودیت',
+                onPressed: () async {
+                  if (ipAddress == null) return;
+                  
+                  final confirmed = await showDialog<bool>(
+                    context: context,
+                    builder: (context) => AlertDialog(
+                      title: const Text('رفع مسدودیت دستگاه'),
+                      content: Text(
+                        'آیا مطمئن هستید که می‌خواهید مسدودیت دستگاه ${ipAddress} را بردارید؟',
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('لغو'),
+                        ),
+                        ElevatedButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.green,
+                            foregroundColor: Colors.white,
+                          ),
+                          child: const Text('رفع مسدودیت'),
+                        ),
+                      ],
+                    ),
+                  );
+
+                  if (confirmed == true) {
+                    try {
+                      final provider = Provider.of<ClientsProvider>(context, listen: false);
+                      final success = await provider.unbanClient(
+                        ipAddress!,
+                        macAddress: macAddress,
+                        hostname: hostName?.toString(),
+                        ssid: banned['ssid']?.toString(),
+                      );
+                      
+                      if (mounted) {
+                        if (success) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('مسدودیت دستگاه با موفقیت برداشته شد'),
+                              backgroundColor: Colors.green,
+                              behavior: SnackBarBehavior.floating,
+                            ),
+                          );
+                          // به‌روزرسانی لیست
+                          provider.loadBannedClients();
+                        } else {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('خطا: ${provider.errorMessage ?? "خطا در رفع مسدودیت"}'),
+                              backgroundColor: Colors.red,
+                              behavior: SnackBarBehavior.floating,
+                            ),
+                          );
+                        }
+                      }
+                    } catch (e) {
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('خطا: $e'),
+                            backgroundColor: Colors.red,
+                            behavior: SnackBarBehavior.floating,
+                          ),
+                        );
+                      }
+                    }
+                  }
+                },
+              ),
+              const SizedBox(width: 4),
               const Icon(
                 Icons.chevron_right,
                 color: Colors.grey,

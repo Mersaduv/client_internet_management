@@ -9,6 +9,7 @@ class MikroTikServiceManager {
 
   MikroTikService? _service;
   MikroTikConnection? _currentConnection;
+  Map<String, dynamic>? _routerInfo;
 
   /// دریافت سرویس فعلی
   MikroTikService? get service => _service;
@@ -18,6 +19,9 @@ class MikroTikServiceManager {
 
   /// دریافت اطلاعات اتصال فعلی
   MikroTikConnection? get currentConnection => _currentConnection;
+
+  /// دریافت اطلاعات روتر (کامل - شامل uptime, version, board-name, platform و ...)
+  Map<String, dynamic>? get routerInfo => _routerInfo;
 
   /// اتصال به MikroTik
   Future<bool> connect(MikroTikConnection connection) async {
@@ -33,6 +37,15 @@ class MikroTikServiceManager {
       if (!success) {
         _service = null;
         _currentConnection = null;
+        _routerInfo = null;
+      } else {
+        // دریافت اطلاعات روتر بعد از اتصال موفق
+        try {
+          _routerInfo = await _service!.getRouterInfo();
+        } catch (e) {
+          // ignore errors - router info optional است
+          _routerInfo = null;
+        }
       }
       return success;
     } catch (e) {
@@ -47,6 +60,20 @@ class MikroTikServiceManager {
     _service?.disconnect();
     _service = null;
     _currentConnection = null;
+    _routerInfo = null;
+  }
+
+  /// دریافت اطلاعات روتر (با refresh)
+  Future<Map<String, dynamic>?> getRouterInfo() async {
+    if (_service == null || !isConnected) {
+      return null;
+    }
+    try {
+      _routerInfo = await _service!.getRouterInfo();
+      return _routerInfo;
+    } catch (e) {
+      return _routerInfo; // برگرداندن اطلاعات قبلی در صورت خطا
+    }
   }
 
   /// دریافت همه کلاینت‌ها
@@ -79,6 +106,38 @@ class MikroTikServiceManager {
       throw Exception('اتصال برقرار نشده');
     }
     return await _service!.getBannedClients();
+  }
+
+  /// قفل کردن اتصال دستگاه‌های جدید
+  Future<bool> lockNewConnections() async {
+    if (_service == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+    return await _service!.lockNewConnections();
+  }
+
+  /// رفع قفل اتصال دستگاه‌های جدید
+  Future<bool> unlockNewConnections() async {
+    if (_service == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+    return await _service!.unlockNewConnections();
+  }
+
+  /// بررسی وضعیت قفل اتصال جدید
+  Future<bool> isNewConnectionsLocked() async {
+    if (_service == null || !isConnected) {
+      return false;
+    }
+    return await _service!.isNewConnectionsLocked();
+  }
+
+  /// دریافت لیست IP های مجاز برای قفل
+  Future<Set<String>> getAllowedIpsForLock() async {
+    if (_service == null || !isConnected) {
+      return <String>{};
+    }
+    return await _service!.getAllowedIpsForLock();
   }
 }
 

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import '../models/client_info.dart';
 import '../services/mikrotik_service_manager.dart';
@@ -14,6 +15,12 @@ class ClientsProvider extends ChangeNotifier {
   String? _errorMessage;
   String? _deviceIp;
   bool _isRefreshing = false;
+  Map<String, dynamic>? _routerInfo;
+  bool _isNewConnectionsLocked = false;
+
+  // Timer برای بررسی دوره‌ای دستگاه‌های جدید (real-time auto-ban)
+  Timer? _autoBanCheckTimer;
+  static const Duration _autoBanCheckInterval = Duration(seconds: 5); // هر 5 ثانیه یکبار بررسی
 
   // Getters
   bool get isLoading => _isLoading;
@@ -24,25 +31,46 @@ class ClientsProvider extends ChangeNotifier {
   String? get deviceIp => _deviceIp;
   bool get isRefreshing => _isRefreshing;
   bool get isConnected => _serviceManager.isConnected;
+  Map<String, dynamic>? get routerInfo => _routerInfo;
+  bool get isNewConnectionsLocked => _isNewConnectionsLocked;
 
   /// بارگذاری IP دستگاه
-  Future<void> loadDeviceIp() async {
-    // اگر IP قبلاً لود شده، دوباره لود نکن
-    if (_deviceIp != null && !_isRefreshing) {
+  Future<void> loadDeviceIp({bool forceRefresh = false}) async {
+    // اگر IP قبلاً لود شده و force refresh نیست، دوباره لود نکن
+    if (_deviceIp != null && !_isRefreshing && !forceRefresh) {
       return;
     }
 
     try {
       final ip = await _serviceManager.getDeviceIp().timeout(
-        const Duration(seconds: 5),
+        const Duration(seconds: 10), // افزایش timeout برای اطمینان از تشخیص صحیح
         onTimeout: () => null,
       );
-      if (ip != null && _deviceIp != ip) {
+      if (ip != null) {
+        // همیشه IP را به‌روزرسانی کن (حتی اگر تغییر نکرده باشد)
+        // چون ممکن است IP قبلی اشتباه تشخیص داده شده باشد
         _deviceIp = ip;
         notifyListeners();
       }
     } catch (e) {
       // در صورت خطا، IP قبلی را حفظ کن
+    }
+  }
+
+  /// بارگذاری اطلاعات روتر (board-name و platform)
+  Future<void> loadRouterInfo() async {
+    if (!_serviceManager.isConnected) {
+      return;
+    }
+
+    try {
+      final routerInfo = await _serviceManager.getRouterInfo();
+      if (routerInfo != null) {
+        _routerInfo = routerInfo;
+        notifyListeners();
+      }
+    } catch (e) {
+      // ignore errors - router info optional است
     }
   }
 
@@ -120,27 +148,133 @@ class ClientsProvider extends ChangeNotifier {
         }
       }
 
-      // حذف دستگاه‌های مسدود شده از لیست متصل
+      // بررسی وضعیت قفل اتصال جدید
+      bool wasLocked = _isNewConnectionsLocked;
       try {
+        _isNewConnectionsLocked = await _serviceManager.isNewConnectionsLocked();
+        notifyListeners();
+        
+        // اگر وضعیت قفل تغییر کرد، Timer را به‌روزرسانی کن
+        if (wasLocked != _isNewConnectionsLocked) {
+          _updateAutoBanTimer();
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // اگر قفل فعال است، بررسی و مسدود کردن دستگاه‌های جدید
+      // فقط دستگاه‌هایی که MAC یا IP آن‌ها در لیست اولیه (زمان فعال شدن قفل) نیست را مسدود می‌کنیم
+      if (_isNewConnectionsLocked) {
+        try {
+          // دریافت لیست MAC ها و IP های مجاز (لیست اولیه در زمان فعال شدن قفل)
+          final allowedMacs = await _serviceManager.service?.getAllowedMacsForLock() ?? <String>{};
+          final allowedIps = await _serviceManager.service?.getAllowedIpsForLock() ?? <String>{};
+          
+          // اضافه کردن IP دستگاه کاربر به لیست مجاز (اگر هنوز اضافه نشده)
+          if (_deviceIp != null && !allowedIps.contains(_deviceIp)) {
+            allowedIps.add(_deviceIp!);
+          }
+          
+          // فقط دستگاه‌هایی را مسدود کن که MAC یا IP آن‌ها در لیست اولیه نیست
+          // این یعنی دستگاه‌های جدید که بعد از فعال شدن قفل متصل شده‌اند
+          bool anyDeviceBanned = false;
+          for (var client in clientsList.toList()) {
+            final clientMac = client.macAddress?.toUpperCase();
+            final clientIp = client.ipAddress;
+            
+            // بررسی اینکه آیا دستگاه مجاز است یا نه
+            bool isAllowed = false;
+            
+            // اگر MAC در لیست مجاز است، مجاز است
+            if (clientMac != null && clientMac.isNotEmpty && allowedMacs.contains(clientMac)) {
+              isAllowed = true;
+            }
+            
+            // اگر IP در لیست مجاز است (مثل IP دستگاه کاربر)، مجاز است
+            if (clientIp != null && allowedIps.contains(clientIp)) {
+              isAllowed = true;
+            }
+            
+            // اگر IP دستگاه کاربر است، همیشه مجاز است
+            if (clientIp != null && clientIp == _deviceIp) {
+              isAllowed = true;
+            }
+            
+            // اگر مجاز نیست، مسدود کن و از لیست حذف کن
+            if (!isAllowed) {
+              bool wasBanned = false;
+              try {
+                // مسدود کردن دستگاه جدید
+                if (client.ipAddress != null) {
+                  final banResult = await _serviceManager.service?.banClient(
+                    client.ipAddress!,
+                    macAddress: client.macAddress,
+                    comment: 'Auto-banned: New connection while locked',
+                  );
+                  wasBanned = banResult == true;
+                  if (wasBanned) {
+                    anyDeviceBanned = true;
+                  }
+                }
+              } catch (e) {
+                // ignore errors
+              }
+              // حذف از لیست متصل (حتی اگر banClient خطا داد)
+              clientsList.remove(client);
+            }
+          }
+          
+          // اگر دستگاهی مسدود شد، لیست banned clients را به‌روزرسانی کن (یک بار)
+          if (anyDeviceBanned) {
+            try {
+              await loadBannedClients();
+            } catch (e) {
+              // ignore errors
+            }
+          }
+        } catch (e) {
+          // ignore errors
+        }
+      }
+
+      // حذف دستگاه‌های مسدود شده از لیست متصل
+      // استفاده از Device Fingerprint برای شناسایی دستگاه‌های مسدود شده
+      try {
+        // بررسی و مسدود کردن خودکار دستگاه‌هایی که Device Fingerprint آن‌ها مسدود شده است
+        try {
+          await _serviceManager.service?.checkAndBanBannedDevices();
+        } catch (e) {
+          // ignore errors in auto-ban check
+        }
+
+        // دریافت لیست دستگاه‌های مسدود شده (شامل auto-banned)
         final bannedClients = await _serviceManager.getBannedClients();
         final bannedIps = bannedClients
             .map((b) => b['address']?.toString())
             .where((ip) => ip != null && ip.isNotEmpty)
             .toSet();
 
-        final bannedMacs = bannedClients
-            .map((b) => b['mac_address']?.toString())
-            .where((mac) => mac != null && mac.isNotEmpty)
-            .toSet();
+        final bannedMacs = <String>{};
+        for (var banned in bannedClients) {
+          final mac = banned['mac_address']?.toString();
+          if (mac != null && mac.isNotEmpty) {
+            bannedMacs.add(mac.toUpperCase());
+          }
+        }
 
+        // حذف دستگاه‌های مسدود شده از لیست متصل
         clientsList.removeWhere((client) {
+          // بررسی IP
           if (client.ipAddress != null &&
               bannedIps.contains(client.ipAddress)) {
             return true;
           }
-          if (client.macAddress != null &&
-              bannedMacs.contains(client.macAddress?.toUpperCase())) {
-            return true;
+          // بررسی MAC
+          if (client.macAddress != null) {
+            final clientMacUpper = client.macAddress!.toUpperCase();
+            if (bannedMacs.contains(clientMacUpper)) {
+              return true;
+            }
           }
           return false;
         });
@@ -149,15 +283,10 @@ class ClientsProvider extends ChangeNotifier {
       }
 
       // مرتب‌سازی: دستگاه کاربر در صدر لیست
+      // اگر IP دستگاه کاربر هنوز تشخیص داده نشده، دوباره تلاش کن
       if (_deviceIp == null) {
         try {
-          final ip = await _serviceManager.getDeviceIp().timeout(
-            const Duration(seconds: 2),
-            onTimeout: () => null,
-          );
-          if (ip != null) {
-            _deviceIp = ip;
-          }
+          await loadDeviceIp(forceRefresh: true);
         } catch (e) {
           // ignore
         }
@@ -208,6 +337,7 @@ class ClientsProvider extends ChangeNotifier {
 
     try {
       await loadDeviceIp();
+      await loadRouterInfo();
       await loadClients(showLoading: false);
       await loadBannedClients();
     } finally {
@@ -216,8 +346,9 @@ class ClientsProvider extends ChangeNotifier {
     }
   }
 
-  /// مسدود کردن کلاینت و به‌روزرسانی state
-  Future<bool> banClient(String ipAddress, {String? macAddress}) async {
+  /// مسدود کردن کلاینت با استفاده از Device Fingerprint
+  /// این تابع Device Fingerprint را محاسبه و ذخیره می‌کند
+  Future<bool> banClient(String ipAddress, {String? macAddress, String? hostname, String? ssid}) async {
     if (!_serviceManager.isConnected) {
       _errorMessage = 'اتصال برقرار نشده است.';
       notifyListeners();
@@ -225,12 +356,21 @@ class ClientsProvider extends ChangeNotifier {
     }
 
     try {
-      final success = await _serviceManager.service?.banClient(
+      final success = await _serviceManager.service?.banClientWithFingerprint(
         ipAddress,
         macAddress: macAddress,
+        hostname: hostname,
+        ssid: ssid,
       );
 
       if (success == true) {
+        // بررسی و مسدود کردن خودکار دستگاه‌های دیگر که Device Fingerprint آن‌ها مسدود شده است
+        try {
+          await _serviceManager.service?.checkAndBanBannedDevices();
+        } catch (e) {
+          // ignore errors in auto-ban
+        }
+        
         // به‌روزرسانی فوری state
         await refresh();
         return true;
@@ -243,8 +383,8 @@ class ClientsProvider extends ChangeNotifier {
     }
   }
 
-  /// رفع مسدودیت کلاینت و به‌روزرسانی state
-  Future<bool> unbanClient(String ipAddress, {String? macAddress}) async {
+  /// رفع مسدودیت کلاینت با استفاده از Device Fingerprint
+  Future<bool> unbanClient(String ipAddress, {String? macAddress, String? hostname, String? ssid}) async {
     if (!_serviceManager.isConnected) {
       _errorMessage = 'اتصال برقرار نشده است.';
       notifyListeners();
@@ -252,14 +392,21 @@ class ClientsProvider extends ChangeNotifier {
     }
 
     try {
-      final success = await _serviceManager.service?.unbanClient(
+      final success = await _serviceManager.service?.unbanClientWithFingerprint(
         ipAddress,
         macAddress: macAddress,
+        hostname: hostname,
+        ssid: ssid,
       );
 
       if (success == true) {
         // به‌روزرسانی فوری state
-        await refresh();
+        // ابتدا لیست banned clients را به‌روزرسانی کن تا دستگاه از لیست حذف شود
+        await loadBannedClients();
+        // سپس لیست متصل را به‌روزرسانی کن
+        await loadClients(showLoading: false);
+        // اطمینان از به‌روزرسانی UI
+        notifyListeners();
         return true;
       }
       return false;
@@ -299,6 +446,7 @@ class ClientsProvider extends ChangeNotifier {
 
   /// پاک کردن state (برای logout)
   void clear() {
+    _cancelAutoBanTimer(); // توقف Timer
     _isLoading = false;
     _isDataComplete = false;
     _clients = [];
@@ -306,13 +454,121 @@ class ClientsProvider extends ChangeNotifier {
     _errorMessage = null;
     _deviceIp = null;
     _isRefreshing = false;
+    _routerInfo = null;
+    _isNewConnectionsLocked = false;
     notifyListeners();
   }
 
   /// مقداردهی اولیه (برای بعد از login)
   Future<void> initialize() async {
     await loadDeviceIp();
+    await loadRouterInfo();
     await loadClients();
     await loadBannedClients();
+    // بررسی وضعیت قفل
+    try {
+      _isNewConnectionsLocked = await _serviceManager.isNewConnectionsLocked();
+      _updateAutoBanTimer(); // شروع Timer اگر قفل فعال است
+      notifyListeners();
+    } catch (e) {
+      // ignore
+    }
   }
+
+  /// قفل کردن اتصال دستگاه‌های جدید
+  Future<bool> lockNewConnections() async {
+    if (!_serviceManager.isConnected) {
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return false;
+    }
+
+    try {
+      final success = await _serviceManager.lockNewConnections();
+      if (success) {
+        _isNewConnectionsLocked = true;
+        _updateAutoBanTimer(); // شروع Timer برای بررسی دوره‌ای
+        await refresh();
+        notifyListeners();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      _errorMessage = 'خطا در قفل کردن اتصال جدید: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// رفع قفل اتصال دستگاه‌های جدید
+  Future<bool> unlockNewConnections() async {
+    if (!_serviceManager.isConnected) {
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return false;
+    }
+
+    try {
+      final success = await _serviceManager.unlockNewConnections();
+      if (success) {
+        _isNewConnectionsLocked = false;
+        _updateAutoBanTimer(); // توقف Timer
+        // به‌روزرسانی لیست banned clients برای حذف دستگاه‌های auto-banned که رفع مسدودیت شدند
+        await loadBannedClients();
+        await refresh();
+        notifyListeners();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      _errorMessage = 'خطا در رفع قفل اتصال جدید: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// به‌روزرسانی Timer برای بررسی دوره‌ای دستگاه‌های جدید
+  /// Timer فقط زمانی فعال است که قفل اتصال جدید فعال باشد
+  void _updateAutoBanTimer() {
+    // توقف Timer قبلی (اگر وجود دارد)
+    _autoBanCheckTimer?.cancel();
+    _autoBanCheckTimer = null;
+
+    // اگر قفل فعال است و اتصال برقرار است، Timer را شروع کن
+    if (_isNewConnectionsLocked && _serviceManager.isConnected) {
+      _autoBanCheckTimer = Timer.periodic(_autoBanCheckInterval, (timer) async {
+        // بررسی اینکه آیا هنوز قفل فعال است و اتصال برقرار است
+        if (!_isNewConnectionsLocked || !_serviceManager.isConnected) {
+          timer.cancel();
+          _autoBanCheckTimer = null;
+          return;
+        }
+
+        // بررسی و مسدود کردن دستگاه‌های جدید (بدون نمایش loading)
+        try {
+          // بررسی و مسدود کردن دستگاه‌های جدید
+          await loadClients(showLoading: false);
+          // به‌روزرسانی لیست banned clients برای نمایش دستگاه‌های auto-banned
+          await loadBannedClients();
+          // اطمینان از به‌روزرسانی UI
+          notifyListeners();
+        } catch (e) {
+          // ignore errors - Timer ادامه می‌دهد
+        }
+      });
+    }
+  }
+
+  /// پاک کردن Timer (برای cleanup)
+  void _cancelAutoBanTimer() {
+    _autoBanCheckTimer?.cancel();
+    _autoBanCheckTimer = null;
+  }
+
+  @override
+  void dispose() {
+    _cancelAutoBanTimer();
+    super.dispose();
+  }
+
 }

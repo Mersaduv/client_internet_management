@@ -579,6 +579,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
         final success = await provider.banClient(
           widget.device.ipAddress!,
           macAddress: widget.device.macAddress,
+          hostname: widget.device.hostName,
+          ssid: widget.device.ssid,
         );
         
         if (mounted) {
@@ -655,6 +657,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
         final success = await provider.unbanClient(
           widget.device.ipAddress!,
           macAddress: widget.device.macAddress,
+          hostname: widget.device.hostName,
+          ssid: widget.device.ssid,
         );
         
         if (mounted) {

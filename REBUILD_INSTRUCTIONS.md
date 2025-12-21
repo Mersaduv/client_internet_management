@@ -45,3 +45,4 @@ flutter build apk --debug
 بعد از تغییرات در AndroidManifest.xml **حتماً** باید `flutter clean` و سپس rebuild انجام شود.
 
 
+
