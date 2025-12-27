@@ -10,6 +10,7 @@ class SettingsService {
   static const String _keyPort = 'mikrotik_port';
   static const String _keyUseSsl = 'mikrotik_use_ssl';
   static const String _keyServiceUrl = 'internet_service_url';
+  static const String _keyLoginTimestamp = 'login_timestamp';
 
   // مقادیر پیش‌فرض
   static const String _defaultHost = '192.168.88.1';
@@ -142,6 +143,52 @@ class SettingsService {
       'useSsl': await getUseSsl(),
       'serviceUrl': await getServiceUrl(),
     };
+  }
+
+  /// ذخیره زمان لاگین
+  Future<void> setLoginTimestamp() async {
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_keyLoginTimestamp, timestamp);
+    } catch (e) {
+      // اگر shared_preferences کار نکرد، نادیده بگیر
+    }
+  }
+
+  /// دریافت زمان لاگین
+  Future<int?> getLoginTimestamp() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getInt(_keyLoginTimestamp);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// بررسی انقضای لاگین (14 روز)
+  Future<bool> isLoginExpired() async {
+    final timestamp = await getLoginTimestamp();
+    if (timestamp == null) {
+      return true; // اگر زمان لاگین وجود نداشته باشد، منقضی شده در نظر بگیر
+    }
+    
+    final loginDate = DateTime.fromMillisecondsSinceEpoch(timestamp);
+    final now = DateTime.now();
+    final difference = now.difference(loginDate);
+    
+    // اگر 14 روز یا بیشتر گذشته باشد، منقضی شده است
+    return difference.inDays >= 14;
+  }
+
+  /// پاک کردن زمان لاگین (برای خروج)
+  Future<void> clearLoginTimestamp() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_keyLoginTimestamp);
+    } catch (e) {
+      // اگر shared_preferences کار نکرد، نادیده بگیر
+    }
   }
 
   /// بازنشانی به تنظیمات پیش‌فرض

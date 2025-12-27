@@ -7,6 +7,7 @@ import 'screens/settings_screen.dart';
 import 'screens/device_detail_screen.dart';
 import 'screens/internet_service_screen.dart';
 import 'services/mikrotik_service_manager.dart';
+import 'services/settings_service.dart';
 import 'models/client_info.dart';
 import 'providers/clients_provider.dart';
 
@@ -90,12 +91,34 @@ class MainScaffold extends StatefulWidget {
 class _MainScaffoldState extends State<MainScaffold> {
   int _currentIndex = 0;
   final MikroTikServiceManager _serviceManager = MikroTikServiceManager();
+  final SettingsService _settingsService = SettingsService();
+
+  @override
+  void initState() {
+    super.initState();
+    _checkLoginExpiration();
+  }
+
+  /// بررسی انقضای لاگین
+  Future<void> _checkLoginExpiration() async {
+    final isExpired = await _settingsService.isLoginExpired();
+    if (isExpired && mounted) {
+      // اگر لاگین منقضی شده باشد، به صفحه ورود هدایت کن
+      final provider = Provider.of<ClientsProvider>(context, listen: false);
+      provider.clear();
+      _serviceManager.disconnect();
+      await _settingsService.clearLoginTimestamp();
+      if (mounted) {
+        Navigator.of(context).pushReplacementNamed('/');
+      }
+    }
+  }
 
   void _onTabTapped(int index) {
     if (index == 3) {
       // خروج
       _handleLogout();
-    } else {
+    } else if (index < 3) {
       setState(() {
         _currentIndex = index;
       });
@@ -106,6 +129,11 @@ class _MainScaffoldState extends State<MainScaffold> {
     final provider = Provider.of<ClientsProvider>(context, listen: false);
     provider.clear();
     _serviceManager.disconnect();
+    
+    // پاک کردن زمان لاگین
+    final settingsService = SettingsService();
+    await settingsService.clearLoginTimestamp();
+    
     if (mounted) {
       Navigator.of(context).pushReplacementNamed('/');
     }
@@ -118,8 +146,8 @@ class _MainScaffoldState extends State<MainScaffold> {
         index: _currentIndex,
         children: const [
           HomePage(),
-          SettingsScreen(),
           InternetServiceScreen(),
+          SettingsScreen(),
         ],
       ),
       bottomNavigationBar: Container(
@@ -148,16 +176,16 @@ class _MainScaffoldState extends State<MainScaffold> {
                   isActive: _currentIndex == 0,
                 ),
                 _buildNavItem(
-                  icon: Icons.settings_outlined,
-                  activeIcon: Icons.settings,
-                  label: 'تنظیمات',
+                  icon: Icons.language_outlined,
+                  activeIcon: Icons.language,
+                  label: 'سرویس انترنت',
                   index: 1,
                   isActive: _currentIndex == 1,
                 ),
                 _buildNavItem(
-                  icon: Icons.wifi_outlined,
-                  activeIcon: Icons.wifi,
-                  label: 'سرویس انترنت',
+                  icon: Icons.settings_outlined,
+                  activeIcon: Icons.settings,
+                  label: 'تنظیمات',
                   index: 2,
                   isActive: _currentIndex == 2,
                 ),
@@ -881,7 +909,7 @@ class _HomePageState extends State<HomePage> {
                     try {
                       final provider = Provider.of<ClientsProvider>(context, listen: false);
                       final success = await provider.unbanClient(
-                        ipAddress!,
+                        ipAddress,
                         macAddress: macAddress,
                         hostname: hostName?.toString(),
                         ssid: banned['ssid']?.toString(),

@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:provider/provider.dart';
 import '../models/mikrotik_connection.dart';
 import '../services/mikrotik_service_manager.dart';
 import '../services/settings_service.dart';
-import '../providers/clients_provider.dart';
 
 /// صفحه ورود مدرن و حرفه‌ای
 class LoginScreen extends StatefulWidget {
@@ -30,12 +28,27 @@ class _LoginScreenState extends State<LoginScreen> {
   static const Color _primaryColor = Color(0xFF428B7C);
 
   @override
+  void initState() {
+    super.initState();
+    _checkLoginExpiration();
+  }
+
+  @override
   void dispose() {
     _usernameController.dispose();
     _passwordController.dispose();
     _usernameFocusNode.dispose();
     _passwordFocusNode.dispose();
     super.dispose();
+  }
+
+  /// بررسی انقضای لاگین
+  Future<void> _checkLoginExpiration() async {
+    final isExpired = await _settingsService.isLoginExpired();
+    if (isExpired && mounted) {
+      // اگر لاگین منقضی شده باشد، زمان لاگین را پاک کن
+      await _settingsService.clearLoginTimestamp();
+    }
   }
 
   Future<void> _handleLogin() async {
@@ -73,9 +86,11 @@ class _LoginScreenState extends State<LoginScreen> {
       });
 
       if (success) {
+        // ذخیره زمان لاگین
+        await _settingsService.setLoginTimestamp();
+        
         // اتصال موفق - مقداردهی اولیه Provider و انتقال به صفحه اصلی
         if (mounted) {
-          final provider = Provider.of<ClientsProvider>(context, listen: false);
           // Provider در initState صفحه اصلی initialize می‌شود
           Navigator.of(context).pushReplacementNamed('/home');
         }
