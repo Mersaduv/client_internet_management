@@ -163,7 +163,7 @@ class ClientsProvider extends ChangeNotifier {
       }
 
       // اگر قفل فعال است، بررسی و مسدود کردن دستگاه‌های جدید
-      // فقط دستگاه‌هایی که MAC یا IP آن‌ها در لیست اولیه (زمان فعال شدن قفل) نیست را مسدود می‌کنیم
+      // هر دستگاهی که بعد از فعال شدن قفل وصل شود (حتی اگر قبلاً وصل شده بوده) باید مسدود شود
       if (_isNewConnectionsLocked) {
         try {
           // دریافت لیست MAC ها و IP های مجاز (لیست اولیه در زمان فعال شدن قفل)
@@ -175,8 +175,21 @@ class ClientsProvider extends ChangeNotifier {
             allowedIps.add(_deviceIp!);
           }
           
-          // فقط دستگاه‌هایی را مسدود کن که MAC یا IP آن‌ها در لیست اولیه نیست
-          // این یعنی دستگاه‌های جدید که بعد از فعال شدن قفل متصل شده‌اند
+          // ایجاد یک Set از دستگاه‌های مجاز بر اساس MAC و IP
+          // این برای بررسی سریع‌تر استفاده می‌شود
+          final allowedDevices = <String>{};
+          for (var mac in allowedMacs) {
+            allowedDevices.add('mac:$mac');
+          }
+          for (var ip in allowedIps) {
+            allowedDevices.add('ip:$ip');
+          }
+          
+          // بررسی همه دستگاه‌های متصل فعلی
+          // هر دستگاهی که MAC یا IP آن در لیست اولیه نیست، باید مسدود شود
+          // این شامل دستگاه‌هایی می‌شود که:
+          // 1. برای اولین بار بعد از فعال شدن قفل وصل شده‌اند
+          // 2. قبلاً وصل شده بودند اما disconnect شده‌اند و دوباره وصل شده‌اند
           bool anyDeviceBanned = false;
           for (var client in clientsList.toList()) {
             final clientMac = client.macAddress?.toUpperCase();
@@ -185,26 +198,33 @@ class ClientsProvider extends ChangeNotifier {
             // بررسی اینکه آیا دستگاه مجاز است یا نه
             bool isAllowed = false;
             
-            // اگر MAC در لیست مجاز است، مجاز است
-            if (clientMac != null && clientMac.isNotEmpty && allowedMacs.contains(clientMac)) {
-              isAllowed = true;
-            }
-            
-            // اگر IP در لیست مجاز است (مثل IP دستگاه کاربر)، مجاز است
-            if (clientIp != null && allowedIps.contains(clientIp)) {
-              isAllowed = true;
-            }
-            
             // اگر IP دستگاه کاربر است، همیشه مجاز است
             if (clientIp != null && clientIp == _deviceIp) {
               isAllowed = true;
             }
             
+            // بررسی MAC در لیست مجاز
+            if (!isAllowed && clientMac != null && clientMac.isNotEmpty) {
+              if (allowedDevices.contains('mac:$clientMac')) {
+                isAllowed = true;
+              }
+            }
+            
+            // بررسی IP در لیست مجاز
+            if (!isAllowed && clientIp != null && clientIp.isNotEmpty) {
+              if (allowedDevices.contains('ip:$clientIp')) {
+                isAllowed = true;
+              }
+            }
+            
             // اگر مجاز نیست، مسدود کن و از لیست حذف کن
+            // این شامل دستگاه‌هایی می‌شود که:
+            // - برای اولین بار بعد از فعال شدن قفل وصل شده‌اند
+            // - قبلاً وصل شده بودند اما disconnect شده‌اند و دوباره وصل شده‌اند
             if (!isAllowed) {
               bool wasBanned = false;
               try {
-                // مسدود کردن دستگاه جدید
+                // مسدود کردن دستگاه جدید یا دستگاه که دوباره وصل شده
                 if (client.ipAddress != null) {
                   final banResult = await _serviceManager.service?.banClient(
                     client.ipAddress!,
