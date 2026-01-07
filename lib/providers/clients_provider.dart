@@ -187,9 +187,11 @@ class ClientsProvider extends ChangeNotifier {
           
           // بررسی همه دستگاه‌های متصل فعلی
           // هر دستگاهی که MAC یا IP آن در لیست اولیه نیست، باید مسدود شود
+          // همچنین دستگاه‌هایی که non-static هستند باید مسدود شوند (حتی اگر در لیست مجاز هستند)
           // این شامل دستگاه‌هایی می‌شود که:
           // 1. برای اولین بار بعد از فعال شدن قفل وصل شده‌اند
           // 2. قبلاً وصل شده بودند اما disconnect شده‌اند و دوباره وصل شده‌اند
+          // 3. دستگاه‌هایی که non-static هستند (باید همیشه مسدود شوند)
           bool anyDeviceBanned = false;
           for (var client in clientsList.toList()) {
             final clientMac = client.macAddress?.toUpperCase();
@@ -203,28 +205,48 @@ class ClientsProvider extends ChangeNotifier {
               isAllowed = true;
             }
             
-            // بررسی MAC در لیست مجاز
-            if (!isAllowed && clientMac != null && clientMac.isNotEmpty) {
-              if (allowedDevices.contains('mac:$clientMac')) {
-                isAllowed = true;
+            // اگر دستگاه کاربر نیست، بررسی کن که آیا static است یا نه
+            // دستگاه‌های non-static باید مسدود شوند (حتی اگر در لیست مجاز هستند)
+            if (!isAllowed && clientIp != null) {
+              bool isStatic = false;
+              try {
+                isStatic = await _serviceManager.isDeviceStatic(
+                  clientIp,
+                  clientMac,
+                );
+              } catch (e) {
+                // اگر نتوانستیم بررسی کنیم، فرض می‌کنیم non-static است
+                isStatic = false;
               }
+              
+              // اگر دستگاه static است، بررسی کن که آیا در لیست مجاز است یا نه
+              // اگر static نیست، مجاز نیست (باید مسدود شود)
+              if (isStatic) {
+                // دستگاه static است - بررسی کن که آیا در لیست مجاز است
+                if (clientMac != null && clientMac.isNotEmpty) {
+                  if (allowedDevices.contains('mac:$clientMac')) {
+                    isAllowed = true;
+                  }
+                }
+                
+                if (!isAllowed && clientIp.isNotEmpty) {
+                  if (allowedDevices.contains('ip:$clientIp')) {
+                    isAllowed = true;
+                  }
+                }
+              }
+              // اگر non-static است، isAllowed = false (باید مسدود شود)
             }
             
-            // بررسی IP در لیست مجاز
-            if (!isAllowed && clientIp != null && clientIp.isNotEmpty) {
-              if (allowedDevices.contains('ip:$clientIp')) {
-                isAllowed = true;
-              }
-            }
-            
-            // اگر مجاز نیست، مسدود کن و از لیست حذف کن
+            // اگر مجاز نیست یا non-static است، مسدود کن و از لیست حذف کن
             // این شامل دستگاه‌هایی می‌شود که:
             // - برای اولین بار بعد از فعال شدن قفل وصل شده‌اند
             // - قبلاً وصل شده بودند اما disconnect شده‌اند و دوباره وصل شده‌اند
+            // - دستگاه‌هایی که non-static هستند (باید همیشه مسدود شوند)
             if (!isAllowed) {
               bool wasBanned = false;
               try {
-                // مسدود کردن دستگاه جدید یا دستگاه که دوباره وصل شده
+                // مسدود کردن دستگاه جدید یا دستگاه که دوباره وصل شده یا non-static
                 if (client.ipAddress != null) {
                   final banResult = await _serviceManager.service?.banClient(
                     client.ipAddress!,
@@ -459,6 +481,53 @@ class ClientsProvider extends ChangeNotifier {
       return false;
     } catch (e) {
       _errorMessage = 'خطا در تنظیم سرعت: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// بررسی اینکه آیا دستگاه static است یا نه
+  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress) async {
+    if (!_serviceManager.isConnected) {
+      return false;
+    }
+
+    try {
+      return await _serviceManager.isDeviceStatic(ipAddress, macAddress);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// تبدیل دستگاه به static یا non-static و به‌روزرسانی state
+  Future<bool> setDeviceStaticStatus(
+    String ipAddress,
+    String? macAddress, {
+    String? hostname,
+    bool isStatic = true,
+  }) async {
+    if (!_serviceManager.isConnected) {
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return false;
+    }
+
+    try {
+      final success = await _serviceManager.setDeviceStaticStatus(
+        ipAddress,
+        macAddress,
+        hostname: hostname,
+        isStatic: isStatic,
+      );
+
+      if (success) {
+        // به‌روزرسانی فوری state
+        await refresh();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      _errorMessage = 'خطا در تبدیل دستگاه: $e';
       notifyListeners();
       return false;
     }

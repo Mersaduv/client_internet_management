@@ -139,5 +139,31 @@ class MikroTikServiceManager {
     }
     return await _service!.getAllowedIpsForLock();
   }
+
+  /// بررسی اینکه آیا دستگاه static است یا نه
+  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress) async {
+    if (_service == null || !isConnected) {
+      return false;
+    }
+    return await _service!.isDeviceStatic(ipAddress, macAddress);
+  }
+
+  /// تبدیل دستگاه به static یا non-static
+  Future<bool> setDeviceStaticStatus(
+    String ipAddress,
+    String? macAddress, {
+    String? hostname,
+    bool isStatic = true,
+  }) async {
+    if (_service == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+    return await _service!.setDeviceStaticStatus(
+      ipAddress,
+      macAddress,
+      hostname: hostname,
+      isStatic: isStatic,
+    );
+  }
 }
 

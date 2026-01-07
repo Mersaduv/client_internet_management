@@ -25,26 +25,57 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
   final MikroTikServiceManager _serviceManager = MikroTikServiceManager();
   bool _isLoading = false;
   String? _speedLimit;
+  bool? _isStatic;
 
   static const Color _primaryColor = Color(0xFF428B7C);
 
   @override
   void initState() {
     super.initState();
-    _loadSpeedLimit();
+    // بارگذاری اطلاعات به صورت غیرهمزمان و بدون blocking کردن UI
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadSpeedLimit();
+      _checkStaticStatus();
+    });
+  }
+
+  Future<void> _checkStaticStatus() async {
+    if (widget.device.ipAddress == null || widget.isBanned) {
+      return;
+    }
+
+    try {
+      final isStatic = await _serviceManager.isDeviceStatic(
+        widget.device.ipAddress,
+        widget.device.macAddress,
+      ).timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => false,
+      );
+      if (mounted) {
+        setState(() {
+          _isStatic = isStatic;
+        });
+      }
+    } catch (e) {
+      // در صورت خطا، وضعیت را null نگه دار (ناشناخته)
+      if (mounted) {
+        setState(() {
+          _isStatic = null;
+        });
+      }
+    }
   }
 
   Future<void> _loadSpeedLimit() async {
-    if (widget.device.ipAddress == null) return;
+    if (widget.device.ipAddress == null) {
+      return;
+    }
     
     // اگر دستگاه مسدود است، سرعت را لود نکن
     if (widget.isBanned) {
       return;
     }
-
-    setState(() {
-      _isLoading = true;
-    });
 
     try {
       // دریافت لیست Simple Queues
@@ -53,26 +84,26 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
         if (mounted) {
           setState(() {
             _speedLimit = 'N/A';
-            _isLoading = false;
           });
         }
         return;
       }
 
-      // دریافت لیست queues
-      final queues = await service.getClientSpeed(widget.device.ipAddress!);
+      // دریافت لیست queues با timeout
+      final queues = await service.getClientSpeed(widget.device.ipAddress!).timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => null,
+      );
       
       if (mounted) {
         setState(() {
           _speedLimit = queues?['max_limit'] ?? 'N/A';
-          _isLoading = false;
         });
       }
     } catch (e) {
       if (mounted) {
         setState(() {
           _speedLimit = 'N/A';
-          _isLoading = false;
         });
       }
     }
@@ -698,6 +729,96 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
     }
   }
 
+  Future<void> _toggleStaticStatus() async {
+    if (widget.device.ipAddress == null) return;
+
+    final isCurrentlyStatic = _isStatic == true;
+    final actionText = isCurrentlyStatic ? 'غیر ثابت' : 'ثابت';
+    final message = isCurrentlyStatic
+        ? 'آیا مطمئن هستید که می‌خواهید دستگاه ${widget.device.ipAddress} را غیر ثابت کنید؟\n\nاین کار باعث می‌شود که:\n• دستگاه از لیست مجاز حذف شود\n• اگر قفل اتصال فعال باشد، دستگاه نمی‌تواند متصل شود\n• دستگاه به عنوان دستگاه جدید شناسایی شود'
+        : 'آیا مطمئن هستید که می‌خواهید دستگاه ${widget.device.ipAddress} را ثابت کنید؟\n\nاین کار باعث می‌شود که:\n• دستگاه به لیست مجاز اضافه شود\n• IP دستگاه ثابت بماند\n• اگر قفل اتصال فعال باشد، دستگاه می‌تواند متصل شود';
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('تبدیل به $actionText'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('لغو'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isCurrentlyStatic ? Colors.orange : _primaryColor,
+              foregroundColor: Colors.white,
+            ),
+            child: Text('تبدیل به $actionText'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      setState(() {
+        _isLoading = true;
+      });
+
+      try {
+        final provider = Provider.of<ClientsProvider>(context, listen: false);
+        final success = await provider.setDeviceStaticStatus(
+          widget.device.ipAddress!,
+          widget.device.macAddress,
+          hostname: widget.device.hostName,
+          isStatic: !isCurrentlyStatic,
+        );
+
+        if (mounted) {
+          if (success) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'دستگاه با موفقیت به $actionText تبدیل شد',
+                ),
+                backgroundColor: Colors.green,
+              ),
+            );
+            // به‌روزرسانی وضعیت static
+            await _checkStaticStatus();
+            setState(() {
+              _isLoading = false;
+            });
+            // به‌روزرسانی لیست
+            Navigator.pop(context, true);
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('خطا: ${provider.errorMessage ?? "خطا در تبدیل دستگاه"}'),
+                backgroundColor: Colors.red,
+              ),
+            );
+            setState(() {
+              _isLoading = false;
+            });
+          }
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('خطا: $e'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          setState(() {
+            _isLoading = false;
+          });
+        }
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -706,9 +827,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
         backgroundColor: _primaryColor,
         foregroundColor: Colors.white,
       ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : SingleChildScrollView(
+      body: SingleChildScrollView(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -847,8 +966,43 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                               ],
                             ),
                           )
-                        else if (_speedLimit != null && _speedLimit != 'N/A')
-                          _buildSpeedInfoRow(_speedLimit!),
+                        else ...[
+                          // نمایش وضعیت static - فقط برای دستگاه‌های ثابت
+                          if (_isStatic == true)
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              margin: const EdgeInsets.only(top: 8),
+                              decoration: BoxDecoration(
+                                color: Colors.green.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: Colors.green.withOpacity(0.3),
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(
+                                    Icons.check_circle,
+                                    color: Colors.green,
+                                    size: 20,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      'این دستگاه ثابت است (می‌تواند همیشه متصل شود)',
+                                      style: const TextStyle(
+                                        color: Colors.green,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          if (_speedLimit != null && _speedLimit != 'N/A')
+                            _buildSpeedInfoRow(_speedLimit!),
+                        ],
                       ],
                     ),
                   ),
@@ -885,6 +1039,47 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                             ),
                           ),
                         ),
+                        const SizedBox(height: 12),
+                        // دکمه تبدیل به static/non-static (فقط برای دستگاه‌های غیرمسدود)
+                        if (!widget.isBanned)
+                          LayoutBuilder(
+                            builder: (context, constraints) {
+                              final isWide = constraints.maxWidth > 400;
+                              return ElevatedButton.icon(
+                                onPressed: _isLoading ? null : _toggleStaticStatus,
+                                icon: Icon(
+                                  _isStatic == true 
+                                      ? Icons.check_circle 
+                                      : Icons.radio_button_unchecked,
+                                  size: isWide ? 24 : 20,
+                                ),
+                                label: Text(
+                                  _isStatic == true 
+                                      ? 'تبدیل به غیر Static' 
+                                      : 'تبدیل به Static',
+                                  style: TextStyle(
+                                    fontSize: isWide ? 18 : 16,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: _isStatic == true 
+                                      ? Colors.orange 
+                                      : _primaryColor,
+                                  foregroundColor: Colors.white,
+                                  disabledBackgroundColor: Colors.grey.shade300,
+                                  padding: EdgeInsets.symmetric(
+                                    vertical: isWide ? 16 : 14,
+                                    horizontal: isWide ? 24 : 16,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  elevation: 2,
+                                ),
+                              );
+                            },
+                          ),
                         const SizedBox(height: 12),
                         if (widget.isBanned)
                           ElevatedButton.icon(
