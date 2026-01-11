@@ -2895,30 +2895,70 @@ class MikroTikService {
   }
 
   /// بررسی اینکه آیا DHCP lease دستگاه static است یا نه
-  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress) async {
+  /// این متد از IP، MAC و hostname برای شناسایی استفاده می‌کند
+  /// این برای حالتی است که MAC Address تغییر کرده باشد (مثلاً Private MAC در iOS)
+  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress, {String? hostname}) async {
+    print('[STATIC] MikroTikService.isDeviceStatic: شروع');
+    print('[STATIC] IP: $ipAddress, MAC: $macAddress, hostname: $hostname');
+    print('[STATIC] isConnected: $isConnected, _client: ${_client != null}');
+    
     if (_client == null || !isConnected) {
+      print('[STATIC] MikroTikService.isDeviceStatic: اتصال برقرار نیست');
       return false;
     }
 
-    if (ipAddress == null && macAddress == null) {
+    if (ipAddress == null && macAddress == null && hostname == null) {
+      print('[STATIC] MikroTikService.isDeviceStatic: IP، MAC و hostname همه null هستند');
       return false;
     }
 
     try {
+      print('[STATIC] MikroTikService.isDeviceStatic: دریافت لیست DHCP leases');
       final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+      print('[STATIC] MikroTikService.isDeviceStatic: تعداد leases: ${dhcpLeases.length}');
+      
       for (var lease in dhcpLeases) {
         final leaseMac = lease['mac-address']?.toString().toUpperCase();
         final leaseIp = lease['address']?.toString();
+        final leaseHostname = lease['host-name']?.toString();
         final isStatic = lease['dynamic']?.toString().toLowerCase() == 'false';
+        final leaseId = lease['.id'];
+        final leaseComment = lease['comment']?.toString() ?? '';
 
-        // بررسی تطابق MAC یا IP
-        if ((macAddress != null && leaseMac == macAddress.toUpperCase()) ||
-            (ipAddress != null && leaseIp == ipAddress)) {
-          return isStatic;
+        print('[STATIC] بررسی lease: ID=$leaseId, IP=$leaseIp, MAC=$leaseMac, Hostname=$leaseHostname, isStatic=$isStatic');
+
+        // اولویت 1: بررسی تطابق MAC (اگر MAC تغییر نکرده باشد)
+        if (macAddress != null && leaseMac == macAddress.toUpperCase() && isStatic) {
+          print('[STATIC] MikroTikService.isDeviceStatic: تطابق MAC پیدا شد! نتیجه: $isStatic');
+          return true;
+        }
+        
+        // اولویت 2: بررسی تطابق IP (اگر IP ثابت باشد)
+        if (ipAddress != null && leaseIp == ipAddress && isStatic) {
+          print('[STATIC] MikroTikService.isDeviceStatic: تطابق IP پیدا شد! نتیجه: $isStatic');
+          return true;
+        }
+        
+        // اولویت 3: بررسی تطابق hostname (برای حالتی که MAC تغییر کرده)
+        // این مهم است برای iOS/Android که Private MAC Address دارند
+        if (hostname != null && 
+            hostname.isNotEmpty && 
+            leaseHostname != null && 
+            leaseHostname.isNotEmpty &&
+            leaseHostname.toLowerCase().trim() == hostname.toLowerCase().trim() &&
+            isStatic &&
+            leaseComment.contains('Static Device')) {
+          print('[STATIC] MikroTikService.isDeviceStatic: تطابق hostname پیدا شد! نتیجه: $isStatic');
+          print('[STATIC] MAC ممکن است تغییر کرده باشد اما hostname یکسان است');
+          return true;
         }
       }
+      
+      print('[STATIC] MikroTikService.isDeviceStatic: هیچ lease مطابق پیدا نشد');
       return false;
     } catch (e) {
+      print('[STATIC] MikroTikService.isDeviceStatic: خطا: $e');
+      print('[STATIC] Stack trace: ${StackTrace.current}');
       return false;
     }
   }
@@ -2932,14 +2972,21 @@ class MikroTikService {
     String? hostname,
     bool isStatic = true,
   }) async {
+    print('[STATIC] MikroTikService.setDeviceStaticStatus: شروع');
+    print('[STATIC] IP: $ipAddress, MAC: $macAddress, hostname: $hostname, isStatic: $isStatic');
+    print('[STATIC] isConnected: $isConnected, _client: ${_client != null}');
+    
     if (_client == null || !isConnected) {
+      print('[STATIC] MikroTikService.setDeviceStaticStatus: اتصال برقرار نیست');
       throw Exception('اتصال برقرار نشده');
     }
 
     try {
       // پیدا کردن MAC address از IP اگر داده نشده باشد
       String? macToUse = macAddress;
+      print('[STATIC] MAC اولیه: $macToUse');
       if (macToUse == null) {
+        print('[STATIC] MAC null است، جستجو در DHCP leases...');
         try {
           final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
           for (var lease in dhcpLeases) {
@@ -2950,78 +2997,137 @@ class MikroTikService {
           }
 
           if (macToUse == null) {
+            print('[STATIC] MAC در DHCP پیدا نشد، جستجو در ARP table...');
             final arpEntries = await _client!.talk(['/ip/arp/print']);
             for (var arp in arpEntries) {
               if (arp['address']?.toString() == ipAddress) {
                 macToUse = arp['mac-address']?.toString();
+                print('[STATIC] MAC در ARP پیدا شد: $macToUse');
                 break;
               }
             }
           }
         } catch (e) {
-          // ignore
+          print('[STATIC] خطا در جستجوی MAC: $e');
         }
       }
 
       if (macToUse == null) {
+        print('[STATIC] MAC address پیدا نشد!');
         throw Exception('MAC address پیدا نشد');
       }
 
+      print('[STATIC] MAC نهایی استفاده شده: $macToUse');
+
       if (isStatic) {
+        print('[STATIC] تبدیل به Static: شروع فرایند');
         // تبدیل به static: اضافه کردن به لیست مجاز
 
         // 1. تبدیل DHCP lease به static
         try {
+          print('[STATIC] مرحله 1: بررسی و تبدیل DHCP lease به static');
           final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+          print('[STATIC] تعداد DHCP leases: ${dhcpLeases.length}');
           String? leaseId;
           for (var lease in dhcpLeases) {
             final leaseMac = lease['mac-address']?.toString().toUpperCase();
             final leaseIp = lease['address']?.toString();
+            print('[STATIC] بررسی lease: IP=$leaseIp, MAC=$leaseMac');
             if (leaseMac == macToUse.toUpperCase() || leaseIp == ipAddress) {
               leaseId = lease['.id'];
+              print('[STATIC] Lease مطابق پیدا شد: ID=$leaseId');
               break;
             }
           }
 
           if (leaseId != null) {
+            print('[STATIC] تبدیل lease موجود به static: ID=$leaseId');
             // تبدیل به static lease
             try {
               await _client!.talk([
                 '/ip/dhcp-server/lease/make-static',
                 '=.id=$leaseId',
               ]);
+              print('[STATIC] Lease با موفقیت به static تبدیل شد');
             } catch (e) {
-              // ممکن است قبلاً static باشد - ignore
+              print('[STATIC] خطا در تبدیل lease به static (ممکن است قبلاً static باشد): $e');
             }
           } else {
-            // اگر lease وجود ندارد، یک static lease جدید ایجاد کن
-            await _createOrUpdateStaticLease(
-              ipAddress,
-              macToUse,
-              hostname: hostname,
-              comment: 'Static Device - Lock Allowed',
-            );
+            print('[STATIC] Lease موجود نیست، بررسی با hostname...');
+            
+            // اگر lease با MAC پیدا نشد، با hostname جستجو کن
+            // این برای حالتی است که MAC تغییر کرده باشد
+            String? existingLeaseByHostname;
+            if (hostname != null && hostname.isNotEmpty) {
+              for (var lease in dhcpLeases) {
+                final leaseHostname = lease['host-name']?.toString();
+                final leaseComment = lease['comment']?.toString() ?? '';
+                final isStatic = lease['dynamic']?.toString().toLowerCase() == 'false';
+                
+                if (leaseHostname != null && 
+                    leaseHostname.isNotEmpty &&
+                    leaseHostname.toLowerCase().trim() == hostname.toLowerCase().trim() &&
+                    isStatic &&
+                    leaseComment.contains('Static Device')) {
+                  existingLeaseByHostname = lease['.id'];
+                  print('[STATIC] Lease با hostname پیدا شد: ID=$existingLeaseByHostname');
+                  // به‌روزرسانی MAC در lease موجود
+                  if (existingLeaseByHostname != null) {
+                    try {
+                      await _client!.talk([
+                        '/ip/dhcp-server/lease/set',
+                        '=.id=$existingLeaseByHostname',
+                        '=mac-address=$macToUse',
+                        '=address=$ipAddress',
+                      ]);
+                      print('[STATIC] MAC و IP در lease موجود به‌روزرسانی شد');
+                      break;
+                    } catch (e) {
+                      print('[STATIC] خطا در به‌روزرسانی lease: $e');
+                    }
+                  }
+                }
+              }
+            }
+            
+            // اگر با hostname هم پیدا نشد، یک static lease جدید ایجاد کن
+            if (existingLeaseByHostname == null) {
+              print('[STATIC] ایجاد static lease جدید');
+              await _createOrUpdateStaticLease(
+                ipAddress,
+                macToUse,
+                hostname: hostname,
+                comment: 'Static Device - Lock Allowed',
+              );
+              print('[STATIC] Static lease جدید ایجاد شد');
+            }
           }
         } catch (e) {
-          // ignore - DHCP ممکن است فعال نباشد
+          print('[STATIC] خطا در تبدیل DHCP lease (DHCP ممکن است فعال نباشد): $e');
         }
 
         // 2. اضافه کردن به Wireless Access List (اگر wireless است)
         try {
+          print('[STATIC] مرحله 2: اضافه کردن به Wireless Access List');
           final wirelessInterfaces = await _client!.talk(['/interface/wireless/print']);
+          print('[STATIC] تعداد wireless interfaces: ${wirelessInterfaces.length}');
           for (var wifiInterface in wirelessInterfaces) {
             final interfaceName = wifiInterface['name']?.toString();
+            print('[STATIC] بررسی interface: $interfaceName');
             if (interfaceName != null) {
               // بررسی اینکه آیا قبلاً اضافه شده
               bool exists = false;
               final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+              print('[STATIC] تعداد access list entries: ${accessList.length}');
               for (var acl in accessList) {
                 if (acl['mac-address']?.toString().toUpperCase() == macToUse.toUpperCase() &&
                     acl['interface']?.toString() == interfaceName) {
                   exists = true;
+                  print('[STATIC] Access list entry موجود است: ${acl['.id']}');
                   // اگر action allow نیست، تغییر بده
                   if (acl['action']?.toString() != 'allow') {
                     final aclId = acl['.id'];
+                    print('[STATIC] تغییر action به allow: ID=$aclId');
                     if (aclId != null) {
                       await _client!.talk([
                         '/interface/wireless/access-list/set',
@@ -3029,6 +3135,7 @@ class MikroTikService {
                         '=action=allow',
                         '=comment=Static Device - Lock Allowed',
                       ]);
+                      print('[STATIC] Action با موفقیت تغییر کرد');
                     }
                   }
                   break;
@@ -3037,6 +3144,7 @@ class MikroTikService {
 
               // اگر وجود ندارد، اضافه کن
               if (!exists) {
+                print('[STATIC] اضافه کردن access list entry جدید');
                 await _client!.talk([
                   '/interface/wireless/access-list/add',
                   '=interface=$interfaceName',
@@ -3044,32 +3152,43 @@ class MikroTikService {
                   '=action=allow',
                   '=comment=Static Device - Lock Allowed',
                 ]);
+                print('[STATIC] Access list entry با موفقیت اضافه شد');
               }
             }
           }
         } catch (e) {
-          // ignore - wireless ممکن است فعال نباشد
+          print('[STATIC] خطا در اضافه کردن به Wireless Access List (wireless ممکن است فعال نباشد): $e');
         }
 
         // 3. اضافه کردن به لیست مجاز در SharedPreferences
         try {
+          print('[STATIC] مرحله 3: اضافه کردن به SharedPreferences');
           final prefs = await SharedPreferences.getInstance();
           final allowedMacsList = prefs.getStringList('locked_allowed_macs') ?? [];
           final macUpper = macToUse.toUpperCase();
           if (!allowedMacsList.contains(macUpper)) {
             allowedMacsList.add(macUpper);
             await prefs.setStringList('locked_allowed_macs', allowedMacsList);
+            print('[STATIC] MAC به لیست مجاز اضافه شد: $macUpper');
+          } else {
+            print('[STATIC] MAC قبلاً در لیست مجاز بود');
           }
 
           final allowedIpsList = prefs.getStringList('locked_allowed_ips') ?? [];
           if (!allowedIpsList.contains(ipAddress)) {
             allowedIpsList.add(ipAddress);
             await prefs.setStringList('locked_allowed_ips', allowedIpsList);
+            print('[STATIC] IP به لیست مجاز اضافه شد: $ipAddress');
+          } else {
+            print('[STATIC] IP قبلاً در لیست مجاز بود');
           }
         } catch (e) {
-          // ignore - SharedPreferences optional است
+          print('[STATIC] خطا در اضافه کردن به SharedPreferences: $e');
         }
+        
+        print('[STATIC] تبدیل به Static با موفقیت انجام شد');
       } else {
+        print('[STATIC] تبدیل به غیر Static: شروع فرایند');
         // تبدیل به non-static: حذف از همه جا
 
         // 1. حذف Static DHCP lease (تبدیل به dynamic با حذف lease)
@@ -3103,11 +3222,16 @@ class MikroTikService {
         // حذف همه rule های access list که مربوط به این MAC هستند و action=allow دارند
         // (rule های ban با action=deny/reject را نگه داریم)
         try {
+          print('[STATIC] مرحله 2: حذف از Wireless Access List');
           final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
+          print('[STATIC] تعداد access list entries: ${accessList.length}');
           for (var acl in accessList) {
             final aclMac = acl['mac-address']?.toString().toUpperCase();
             final aclAction = acl['action']?.toString();
             final aclComment = acl['comment']?.toString() ?? '';
+            final aclId = acl['.id'];
+            
+            print('[STATIC] بررسی ACL: ID=$aclId, MAC=$aclMac, Action=$aclAction, Comment=$aclComment');
             
             // اگر MAC مطابقت دارد و action=allow است، حذف کن
             // همچنین rule هایی با comment مربوط به static/lock را هم حذف کن
@@ -3116,77 +3240,90 @@ class MikroTikService {
                 (aclAction == 'allow' || 
                  aclComment == 'Static Device - Lock Allowed' ||
                  aclComment == 'Lock New Connections - Allowed Device')) {
-              final aclId = acl['.id'];
+              print('[STATIC] ACL مطابق پیدا شد، حذف می‌کنم: ID=$aclId');
               if (aclId != null) {
                 try {
                   await _client!.talk([
                     '/interface/wireless/access-list/remove',
                     '=.id=$aclId',
                   ]);
+                  print('[STATIC] ACL با موفقیت حذف شد');
                 } catch (e) {
-                  // ignore
+                  print('[STATIC] خطا در حذف ACL: $e');
                 }
               }
             }
           }
         } catch (e) {
-          // ignore - wireless ممکن است فعال نباشد
+          print('[STATIC] خطا در حذف از Wireless Access List (wireless ممکن است فعال نباشد): $e');
         }
 
         // 3. حذف Static ARP entries (اگر وجود داشته باشد)
         try {
+          print('[STATIC] مرحله 3: حذف Static ARP entries');
           final arpEntries = await _client!.talk(['/ip/arp/print']);
+          print('[STATIC] تعداد ARP entries: ${arpEntries.length}');
           for (var arp in arpEntries) {
             final arpMac = arp['mac-address']?.toString().toUpperCase();
             final arpIp = arp['address']?.toString();
             final isStatic = arp['dynamic']?.toString().toLowerCase() == 'false';
+            final arpId = arp['.id'];
+
+            print('[STATIC] بررسی ARP: ID=$arpId, IP=$arpIp, MAC=$arpMac, isStatic=$isStatic');
 
             if (isStatic && (arpMac == macToUse.toUpperCase() || arpIp == ipAddress)) {
-              final arpId = arp['.id'];
+              print('[STATIC] Static ARP entry مطابق پیدا شد، حذف می‌کنم: ID=$arpId');
               if (arpId != null) {
                 try {
                   await _client!.talk([
                     '/ip/arp/remove',
                     '=.id=$arpId',
                   ]);
+                  print('[STATIC] ARP entry با موفقیت حذف شد');
                 } catch (e) {
-                  // ignore
+                  print('[STATIC] خطا در حذف ARP entry: $e');
                 }
               }
             }
           }
         } catch (e) {
-          // ignore - ARP ممکن است فعال نباشد
+          print('[STATIC] خطا در حذف Static ARP entries (ARP ممکن است فعال نباشد): $e');
         }
 
         // 4. حذف Simple Queue rules (اگر وجود داشته باشد)
         try {
+          print('[STATIC] مرحله 4: حذف Simple Queue rules');
           final queues = await _client!.talk(['/queue/simple/print']);
+          print('[STATIC] تعداد queues: ${queues.length}');
           for (var queue in queues) {
             final queueTarget = queue['target']?.toString();
             final queueDst = queue['dst']?.toString();
             final queueComment = queue['comment']?.toString() ?? '';
+            final queueId = queue['.id'];
+
+            print('[STATIC] بررسی queue: ID=$queueId, Target=$queueTarget, Dst=$queueDst, Comment=$queueComment');
 
             // اگر IP یا MAC در target/dst است و comment مربوط به static/lock است، حذف کن
             if ((queueTarget == ipAddress || queueTarget == macToUse ||
                  queueDst == ipAddress || queueDst == macToUse) &&
                 (queueComment.contains('Static Device') || 
                  queueComment.contains('Lock Allowed'))) {
-              final queueId = queue['.id'];
+              print('[STATIC] Queue مطابق پیدا شد، حذف می‌کنم: ID=$queueId');
               if (queueId != null) {
                 try {
                   await _client!.talk([
                     '/queue/simple/remove',
                     '=.id=$queueId',
                   ]);
+                  print('[STATIC] Queue با موفقیت حذف شد');
                 } catch (e) {
-                  // ignore
+                  print('[STATIC] خطا در حذف queue: $e');
                 }
               }
             }
           }
         } catch (e) {
-          // ignore - Queue ممکن است فعال نباشد
+          print('[STATIC] خطا در حذف Simple Queue rules (Queue ممکن است فعال نباشد): $e');
         }
 
         // 5. قطع Connection Tracking entries (برای قطع اتصال فوری)
@@ -5086,7 +5223,8 @@ class MikroTikService {
     return addedCount;
   }
 
-  /// ایجاد Raw Rule برای Address-List (فقط Raw Rules، نه Filter Rules)
+  /// ایجاد Raw Rule برای Address-List در prerouting (قبل از conntrack)
+  /// این rule در بالای لیست قرار می‌گیرد تا قبل از FastTrack اجرا شود
   Future<int> _createAddressListRawRule(
     String deviceIp,
     String? deviceMac,
@@ -5106,7 +5244,7 @@ class MikroTikService {
         
         if (srcAddress == deviceIp &&
             dstAddressList == addressListName &&
-            comment.contains('Block social')) {
+            (comment.contains('SM-Filter') || comment.contains('Block social'))) {
           final ruleId = rule['.id']?.toString();
           if (ruleId != null) {
             try {
@@ -5123,8 +5261,7 @@ class MikroTikService {
     
     // ایجاد Raw Rule برای drop کردن ترافیک به Address-List
     try {
-      // استفاده از فرمت ساده‌تر برای comment (بدون کاراکترهای خاص)
-      final commentText = 'SM-Filter:Platforms=${platforms.join(",")}';
+      final commentText = 'SM-Filter:Platforms=${platforms.join(",")}|Drop Telegram - prerouting (fast)';
       print('[DEBUG] _createAddressListRawRule: Creating Raw Rule with comment: "$commentText"');
       
       final rawRuleParams = <String, String>{
@@ -5139,6 +5276,7 @@ class MikroTikService {
         rawRuleParams['src-mac-address'] = deviceMac;
       }
 
+      // ایجاد rule
       final rawCommand = <String>['/ip/firewall/raw/add'];
       rawRuleParams.forEach((key, value) {
         rawCommand.add('=$key=$value');
@@ -5149,16 +5287,49 @@ class MikroTikService {
       final result = await _client!.talk(rawCommand);
       print('[DEBUG] _createAddressListRawRule: Result: $result');
       
-      // بررسی مجدد Raw Rule برای اطمینان از اضافه شدن comment
+      // پیدا کردن rule ایجاد شده و انتقال آن به بالای لیست (قبل از FastTrack)
       await Future.delayed(const Duration(milliseconds: 500));
       final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+      String? newRuleId;
       for (final rule in allRawRules) {
         final srcAddr = rule['src-address']?.toString() ?? '';
         final dstList = rule['dst-address-list']?.toString() ?? '';
-        if (srcAddr == deviceIp && dstList == addressListName) {
-          final ruleComment = rule['comment']?.toString() ?? '';
-          print('[DEBUG] _createAddressListRawRule: Verified Raw Rule comment: "$ruleComment"');
+        final comment = rule['comment']?.toString() ?? '';
+        if (srcAddr == deviceIp && 
+            dstList == addressListName &&
+            comment.contains('SM-Filter')) {
+          newRuleId = rule['.id']?.toString();
+          print('[DEBUG] _createAddressListRawRule: Found new rule ID: $newRuleId');
           break;
+        }
+      }
+      
+      // انتقال rule به بالای لیست (موقعیت 0)
+      if (newRuleId != null) {
+        try {
+          // پیدا کردن اولین rule در prerouting chain
+          String? firstRuleId;
+          for (final rule in allRawRules) {
+            final chain = rule['chain']?.toString() ?? '';
+            if (chain == 'prerouting') {
+              firstRuleId = rule['.id']?.toString();
+              break;
+            }
+          }
+          
+          // اگر rule جدید اولین نیست، آن را به بالای لیست منتقل کن
+          if (firstRuleId != null && firstRuleId != newRuleId) {
+            try {
+              await _client!.talk(['/ip/firewall/raw/move', '=.id=$newRuleId', '=destination=0']);
+              print('[DEBUG] _createAddressListRawRule: Moved rule to top of list');
+            } catch (e) {
+              print('[DEBUG] _createAddressListRawRule: Could not move rule to top: $e');
+              // ادامه می‌دهیم - rule ایجاد شده است
+            }
+          }
+        } catch (e) {
+          print('[DEBUG] _createAddressListRawRule: Error moving rule: $e');
+          // ادامه می‌دهیم - rule ایجاد شده است
         }
       }
       
@@ -5185,7 +5356,6 @@ class MikroTikService {
     for (final rule in allRules) {
       final srcAddress = rule['src-address']?.toString() ?? '';
       final dstAddressList = rule['dst-address-list']?.toString() ?? '';
-      final comment = rule['comment']?.toString() ?? '';
       
       // بررسی بدون comment (چون comment ممکن است خالی باشد)
       if (srcAddress == deviceIp && dstAddressList == addressListName) {
@@ -5622,25 +5792,17 @@ class MikroTikService {
         'twitpic.com',
       ],
       'telegram': [
-        'telegram.org',
-        'web.telegram.org',
-        't.me',
-        'telegram.me',
-        'telesco.pe',
-        'tg.dev',
-        'core.telegram.org',
-        // Telegram IP ranges (AS62041)
-        '149.154.160.0/20',  // Telegram IP range
-        '149.154.160.0/23',  // Telegram IP range
-        '149.154.162.0/23',  // Telegram IP range
-        '149.154.164.0/23',  // Telegram IP range
-        '149.154.166.0/23',  // Telegram IP range
-        '91.108.4.0/22',     // Telegram IP range
-        '91.108.8.0/22',     // Telegram IP range
-        '91.108.12.0/22',    // Telegram IP range
-        '91.108.16.0/22',    // Telegram IP range
-        '91.108.20.0/22',    // Telegram IP range
-        '91.108.56.0/22',    // Telegram IP range
+        // Telegram IP ranges (AS62041) - رنج‌های پایه و پایدار
+        '149.154.160.0/20',  // Telegram DC - Main range
+        '149.154.164.0/22',  // Telegram DC
+        '149.154.168.0/22',  // Telegram DC
+        '149.154.172.0/22',  // Telegram DC
+        '91.108.4.0/22',     // Telegram DC
+        '91.108.8.0/22',     // Telegram DC
+        '91.108.12.0/22',    // Telegram DC
+        '91.108.16.0/22',    // Telegram DC
+        '91.108.20.0/22',    // Telegram DC
+        '91.108.56.0/22',    // Telegram DC
       ],
       'whatsapp': [
         'whatsapp.com',
@@ -5746,17 +5908,17 @@ class MikroTikService {
     return addedCount;
   }
 
-  /// فعال‌سازی فیلترینگ شبکه‌های اجتماعی برای یک دستگاه (رویکرد پیشرفته - فقط اپلیکیشن‌ها)
-  /// روش اصلی: Resolve دینامیک + Address-List + TLS-SNI (tls-host) + بلاک DNS عمومی + بلاک DoH/DoT
-  /// این روش فقط اپلیکیشن‌ها را فیلتر می‌کند نه وبسایت‌ها
+  /// فعال‌سازی فیلترینگ شبکه‌های اجتماعی برای یک دستگاه
+  /// روش: Address-List (IP ranges ثابت) + Raw prerouting drop
+  /// این روش کم‌ترین CPU load را دارد و قبل از conntrack اجرا می‌شود
   Future<Map<String, dynamic>> enableSocialMediaFilter(
     String deviceIp, {
     String? deviceMac,
     String? deviceName,
     List<String>? platforms,
-    bool enableDNSBlocking = false, // غیرفعال - فقط برای اپلیکیشن‌ها
+    bool enableDNSBlocking = false, // غیرفعال
     bool enableAddressList = true,
-    bool enableFirewallRule = false, // غیرفعال - نباید Filter Rules ایجاد شود
+    bool enableFirewallRule = false, // غیرفعال - فقط Raw Rule استفاده می‌شود
     bool blockDNSBypass = true,
   }) async {
     if (_client == null || !isConnected) {
@@ -5775,11 +5937,9 @@ class MikroTikService {
       'success': true,
       'device_ip': deviceIp,
       'platforms': selectedPlatforms,
-      'dns_entries_added': 0,
       'address_list_entries_added': 0,
-      'firewall_rules_added': 0,
+      'raw_rules_added': 0,
       'dns_bypass_rules_added': 0,
-      'resolved_domains': 0,
       'old_rules_cleaned': 0,
       'errors': <String>[],
     };
@@ -5793,93 +5953,8 @@ class MikroTikService {
       }
       results['old_rules_cleaned'] = totalCleaned;
 
-      // 1. فعال‌سازی DNS redirect (اجباری کردن استفاده از DNS داخلی)
-      try {
-        await _client!.talk(['/ip/dns/set', '=allow-remote-requests=yes']);
-        
-        // دریافت IP interface داخلی روتر (LAN interface)
-        String? routerLanIp;
-        try {
-          // پیدا کردن IP interface که در همان subnet با deviceIp است
-          final interfaces = await _client!.talk(['/ip/address/print']);
-          final deviceParts = deviceIp.split('.');
-          if (deviceParts.length == 4) {
-            final subnetPrefix = '${deviceParts[0]}.${deviceParts[1]}.${deviceParts[2]}.';
-            for (final iface in interfaces) {
-              final address = iface['address']?.toString() ?? '';
-              if (address.contains('/')) {
-                final ip = address.split('/')[0];
-                if (ip.startsWith(subnetPrefix)) {
-                  routerLanIp = ip;
-                  break;
-                }
-              }
-            }
-          }
-        } catch (e) {
-          // ignore
-        }
-        
-        // اگر پیدا نشد، از connection host استفاده کن
-        routerLanIp ??= _connection?.host;
-        
-        if (routerLanIp == null || routerLanIp.isEmpty) {
-          results['errors'].add('نمی‌توان IP روتر را تشخیص داد');
-        } else {
-          // NAT rule برای redirect DNS به روتر (فقط برای این دستگاه)
-          final natRules = await _client!.talk(['/ip/firewall/nat/print']);
-          bool dnsRedirectExists = false;
-          
-          for (final rule in natRules) {
-            final chain = rule['chain']?.toString() ?? '';
-            final dstPort = rule['dst-port']?.toString() ?? '';
-            final action = rule['action']?.toString() ?? '';
-            final srcAddress = rule['src-address']?.toString() ?? '';
-            final comment = rule['comment']?.toString() ?? '';
-            
-            if (chain == 'dstnat' && 
-                (dstPort == '53' || dstPort == '853') &&
-                action == 'dst-nat' &&
-                srcAddress == deviceIp &&
-                comment.contains('Force DNS')) {
-              dnsRedirectExists = true;
-              break;
-            }
-          }
-          
-          if (!dnsRedirectExists) {
-            // Redirect UDP DNS برای این دستگاه
-            await _client!.talk([
-              '/ip/firewall/nat/add',
-              '=chain=dstnat',
-              '=protocol=udp',
-              '=dst-port=53',
-              '=src-address=$deviceIp',
-              '=action=dst-nat',
-              '=to-addresses=$routerLanIp',
-              '=to-ports=53',
-              '=comment=Force DNS to router - Device: $deviceIp',
-            ]);
-            
-            // Redirect TCP DNS برای این دستگاه
-            await _client!.talk([
-              '/ip/firewall/nat/add',
-              '=chain=dstnat',
-              '=protocol=tcp',
-              '=dst-port=53',
-              '=src-address=$deviceIp',
-              '=action=dst-nat',
-              '=to-addresses=$routerLanIp',
-              '=to-ports=53',
-              '=comment=Force DNS to router - Device: $deviceIp',
-            ]);
-          }
-        }
-      } catch (e) {
-        results['errors'].add('خطا در تنظیم DNS redirect: $e');
-      }
-
-      // 2. بلاک کردن DNS عمومی (8.8.8.8, 1.1.1.1, etc.) - فقط برای این دستگاه
+      // 1. بلاک کردن DNS عمومی (8.8.8.8, 1.1.1.1, etc.) - فقط برای این دستگاه
+      // استفاده از Raw Rules به جای Filter Rules برای کاهش CPU load
       if (blockDNSBypass) {
         try {
           final publicDNSList = [
@@ -5889,18 +5964,20 @@ class MikroTikService {
             '208.67.222.222', '208.67.220.220', // OpenDNS
           ];
           
-          final allRules = await _client!.talk(['/ip/firewall/filter/print']);
+          final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
           int blockedCount = 0;
           
           for (final dnsIp in publicDNSList) {
             bool ruleExists = false;
-            for (final rule in allRules) {
+            for (final rule in allRawRules) {
               final srcAddress = rule['src-address']?.toString() ?? '';
               final dstAddress = rule['dst-address']?.toString() ?? '';
               final comment = rule['comment']?.toString() ?? '';
+              final chain = rule['chain']?.toString() ?? '';
               
               if (srcAddress == deviceIp &&
                   dstAddress == dnsIp &&
+                  chain == 'prerouting' &&
                   comment.contains('Block public DNS')) {
                 ruleExists = true;
                 break;
@@ -5910,8 +5987,8 @@ class MikroTikService {
             if (!ruleExists) {
               try {
                 await _client!.talk([
-                  '/ip/firewall/filter/add',
-                  '=chain=forward',
+                  '/ip/firewall/raw/add',
+                  '=chain=prerouting',
                   '=src-address=$deviceIp',
                   '=dst-address=$dnsIp',
                   '=action=drop',
@@ -5924,103 +6001,18 @@ class MikroTikService {
             }
           }
           
-          // بلاک پورت DoT (853)
-          bool dotRuleExists = false;
-          for (final rule in allRules) {
-            final srcAddress = rule['src-address']?.toString() ?? '';
-            final protocol = rule['protocol']?.toString() ?? '';
-            final dstPort = rule['dst-port']?.toString() ?? '';
-            final comment = rule['comment']?.toString() ?? '';
-            
-            if (srcAddress == deviceIp &&
-                protocol == 'tcp' &&
-                dstPort == '853' &&
-                comment.contains('Block DoT')) {
-              dotRuleExists = true;
-              break;
-            }
-          }
-          
-          if (!dotRuleExists) {
-            try {
-              await _client!.talk([
-                '/ip/firewall/filter/add',
-                '=chain=forward',
-                '=protocol=tcp',
-                '=dst-port=853',
-                '=src-address=$deviceIp',
-                '=action=drop',
-                '=comment=Block DoT - Device: $deviceIp',
-              ]);
-              blockedCount++;
-            } catch (e) {
-              // continue
-            }
-          }
-          
-          // بلاک DoH (DNS over HTTPS) با استفاده از TLS-SNI
-          // DoH از HTTPS استفاده می‌کند، پس باید دامنه‌های DoH را با TLS-SNI بلاک کنیم
-          final dohHosts = [
-            'dns.google',           // Google DoH
-            'dns64.dns.google',     // Google DoH IPv6
-            'cloudflare-dns.com',   // Cloudflare DoH
-            '1dot1dot1dot1.cloudflare-dns.com', // Cloudflare DoH
-            'dns.quad9.net',        // Quad9 DoH
-            'dns.opendns.com',      // OpenDNS DoH
-            'doh.opendns.com',      // OpenDNS DoH
-          ];
-          
-          int dohBlockedCount = 0;
-          for (final dohHost in dohHosts) {
-            bool dohRuleExists = false;
-            for (final rule in allRules) {
-              final srcAddress = rule['src-address']?.toString() ?? '';
-              final tlsHost = rule['tls-host']?.toString() ?? '';
-              final comment = rule['comment']?.toString() ?? '';
-              
-              if (srcAddress == deviceIp &&
-                  tlsHost == dohHost &&
-                  comment.contains('Block DoH')) {
-                dohRuleExists = true;
-                break;
-              }
-            }
-            
-            if (!dohRuleExists) {
-              try {
-                await _client!.talk([
-                  '/ip/firewall/filter/add',
-                  '=chain=forward',
-                  '=protocol=tcp',
-                  '=dst-port=443',
-                  '=src-address=$deviceIp',
-                  '=tls-host=$dohHost',
-                  '=action=drop',
-                  '=comment=Block DoH - $dohHost - Device: $deviceIp',
-                ]);
-                dohBlockedCount++;
-                print('[DEBUG] enableSocialMediaFilter: Blocked DoH host: $dohHost');
-              } catch (e) {
-                print('[DEBUG] enableSocialMediaFilter: Error blocking DoH host $dohHost: $e');
-                // continue
-              }
-            }
-          }
-          
-          results['dns_bypass_rules_added'] = blockedCount + dohBlockedCount;
+          results['dns_bypass_rules_added'] = blockedCount;
         } catch (e) {
           results['errors'].add('خطا در بلاک DNS عمومی: $e');
         }
       }
 
-      // 3. ایجاد Address-List با Resolve دینامیک (روش اصلی برای اپلیکیشن‌ها)
-      // این روش IPهای واقعی را resolve می‌کند و به Address-List اضافه می‌کند
+      // 2. ایجاد Address-List فقط با IP ranges ثابت (بدون resolve دینامیک)
       if (enableAddressList) {
         try {
           const addressListName = 'Blocked-Social';
-          final socialMediaData = await _getSocialMediaAddresses();
           
-          // ابتدا IP rangeهای ثابت را اضافه می‌کنیم
+          // فقط IP rangeهای ثابت را اضافه می‌کنیم (بدون resolve دینامیک)
           print('[DEBUG] enableSocialMediaFilter: Creating Address-List entries for platforms: $selectedPlatforms');
           int staticIPCount = await _createAddressListForStaticIPs(
             selectedPlatforms,
@@ -6028,26 +6020,16 @@ class MikroTikService {
           );
           print('[DEBUG] enableSocialMediaFilter: Static IPs added: $staticIPCount');
           
-          // سپس دامنه‌های مهم را resolve می‌کنیم و IPها را اضافه می‌کنیم
-          int resolvedCount = await _resolveAndAddDomainsToAddressList(
-            selectedPlatforms,
-            addressListName,
-            socialMediaData,
-          );
-          print('[DEBUG] enableSocialMediaFilter: Resolved domains added: $resolvedCount');
+          results['address_list_entries_added'] = staticIPCount;
           
-          results['address_list_entries_added'] = staticIPCount + resolvedCount;
-          results['resolved_domains'] = resolvedCount;
-          
-          // ایجاد Raw Rule برای Address-List (فقط Raw Rules، نه Filter Rules)
-          // مهم: حتی اگر Address-List entries اضافه نشوند، Raw Rule را ایجاد کن
-          // چون ممکن است entries از قبل وجود داشته باشند
+          // ایجاد Raw Rule برای Address-List در prerouting (قبل از conntrack)
           print('[DEBUG] enableSocialMediaFilter: Creating Raw Rule for Address-List...');
           print('[DEBUG] enableSocialMediaFilter: Device IP: $deviceIp, Platforms: $selectedPlatforms');
           
           // بررسی اینکه آیا Raw Rule از قبل وجود دارد
           final existingRawRules = await _client!.talk(['/ip/firewall/raw/print']);
           bool rawRuleExists = false;
+          String? existingRuleId;
           for (final rule in existingRawRules) {
             final srcAddr = rule['src-address']?.toString() ?? '';
             final dstList = rule['dst-address-list']?.toString() ?? '';
@@ -6058,9 +6040,9 @@ class MikroTikService {
                 action == 'drop' &&
                 chain == 'prerouting') {
               rawRuleExists = true;
-              final ruleId = rule['.id']?.toString() ?? '';
+              existingRuleId = rule['.id']?.toString() ?? '';
               final ruleComment = rule['comment']?.toString() ?? '';
-              print('[DEBUG] enableSocialMediaFilter: Raw Rule already exists: ID=$ruleId, comment="$ruleComment"');
+              print('[DEBUG] enableSocialMediaFilter: Raw Rule already exists: ID=$existingRuleId, comment="$ruleComment"');
               break;
             }
           }
@@ -6074,68 +6056,14 @@ class MikroTikService {
                 selectedPlatforms,
                 deviceName,
               );
-              results['address_list_rules_added'] = rawRuleCount;
+              results['raw_rules_added'] = rawRuleCount;
               print('[DEBUG] enableSocialMediaFilter: Raw Rule created: $rawRuleCount');
-              
-              // ایجاد Filter Rule به عنوان backup (برای اطمینان بیشتر)
-              try {
-                final filterRuleCount = await _createAddressListFirewallRule(
-                  deviceIp,
-                  deviceMac,
-                  addressListName,
-                  deviceName,
-                );
-                print('[DEBUG] enableSocialMediaFilter: Filter Rule (backup) created: $filterRuleCount');
-              } catch (e) {
-                print('[DEBUG] enableSocialMediaFilter: Error creating Filter Rule (backup): $e');
-                // ادامه می‌دهیم حتی اگر Filter Rule خطا داد
-              }
-              
-              // بررسی مجدد بعد از ایجاد
-              await Future.delayed(const Duration(milliseconds: 500));
-              final verifyRawRules = await _client!.talk(['/ip/firewall/raw/print']);
-              for (final rule in verifyRawRules) {
-                final srcAddr = rule['src-address']?.toString() ?? '';
-                final dstList = rule['dst-address-list']?.toString() ?? '';
-                if (srcAddr == deviceIp && dstList == addressListName) {
-                  final ruleId = rule['.id']?.toString() ?? '';
-                  final ruleComment = rule['comment']?.toString() ?? '';
-                  final action = rule['action']?.toString() ?? '';
-                  final chain = rule['chain']?.toString() ?? '';
-                  print('[DEBUG] enableSocialMediaFilter: Verified Raw Rule: ID=$ruleId, comment="$ruleComment", action="$action", chain="$chain"');
-                }
-              }
             } catch (e) {
               print('[DEBUG] enableSocialMediaFilter: Error creating Raw Rule: $e');
               results['errors'].add('خطا در ایجاد Raw Rule برای Address-List: $e');
             }
           } else {
-            print('[DEBUG] enableSocialMediaFilter: Raw Rule already exists, checking Filter Rule...');
-            // بررسی وجود Filter Rule
-            final existingFilterRules = await _client!.talk(['/ip/firewall/filter/print']);
-            bool filterRuleExists = false;
-            for (final rule in existingFilterRules) {
-              final srcAddr = rule['src-address']?.toString() ?? '';
-              final dstList = rule['dst-address-list']?.toString() ?? '';
-              if (srcAddr == deviceIp && dstList == addressListName) {
-                filterRuleExists = true;
-                break;
-              }
-            }
-            if (!filterRuleExists) {
-              try {
-                final filterRuleCount = await _createAddressListFirewallRule(
-                  deviceIp,
-                  deviceMac,
-                  addressListName,
-                  deviceName,
-                );
-                print('[DEBUG] enableSocialMediaFilter: Filter Rule (backup) created: $filterRuleCount');
-              } catch (e) {
-                print('[DEBUG] enableSocialMediaFilter: Error creating Filter Rule (backup): $e');
-              }
-            }
-            results['address_list_rules_added'] = 0;
+            results['raw_rules_added'] = 0;
           }
           
           // بررسی نهایی: آیا Address-List entries وجود دارند؟
@@ -6153,89 +6081,57 @@ class MikroTikService {
         }
       }
 
-      // 4. اضافه کردن DNS Static Entries (redirect دامنه‌ها به 127.0.0.1)
-      // این برای بلاک کردن DNS resolution دامنه‌های Facebook است
-      try {
-        print('[DEBUG] enableSocialMediaFilter: Adding DNS Static Entries for platforms: $selectedPlatforms');
-        final socialMediaData = await _getSocialMediaAddresses();
-        final dnsEntriesCount = await _addDNSStaticEntries(selectedPlatforms, socialMediaData);
-        results['dns_entries_added'] = dnsEntriesCount;
-        print('[DEBUG] enableSocialMediaFilter: DNS Static Entries added: $dnsEntriesCount');
-      } catch (e) {
-        print('[DEBUG] enableSocialMediaFilter: Error adding DNS Static Entries: $e');
-        results['errors'].add('خطا در اضافه کردن DNS Static Entries: $e');
-      }
-
-      // 5. ایجاد TLS-SNI Firewall Rules (برای HTTPS blocking)
-      // این rules برای بلاک کردن HTTPS traffic با استفاده از SNI (Server Name Indication)
-      // مهم: فقط برای پلتفرم‌های انتخاب شده و محدود به src-address دستگاه هدف
-      try {
-        print('[DEBUG] enableSocialMediaFilter: Creating TLS-SNI rules for platforms: $selectedPlatforms');
-        final tlsRuleCount = await _createTLSHostRulesForPlatforms(
-          deviceIp,
-          deviceMac,
-          selectedPlatforms,
-          deviceName,
-        );
-        results['firewall_rules_added'] = tlsRuleCount;
-        results['tls_sni_rules_added'] = tlsRuleCount;
-        print('[DEBUG] enableSocialMediaFilter: TLS-SNI rules created: $tlsRuleCount');
-      } catch (e) {
-        print('[DEBUG] enableSocialMediaFilter: Error creating TLS-SNI rules: $e');
-        results['errors'].add('خطا در ایجاد TLS-SNI Rules: $e');
-        results['firewall_rules_added'] = 0;
-        results['tls_sni_rules_added'] = 0;
-      }
-
-      // 5. مسدودسازی QUIC/HTTP3 (UDP 443) برای دستگاه هدف
-      // Facebook/Meta ممکن است از HTTP/3 (QUIC) استفاده کند
-      try {
-        print('[DEBUG] enableSocialMediaFilter: Creating QUIC blocking rule...');
-        final allRules = await _client!.talk(['/ip/firewall/filter/print']);
-        bool quicRuleExists = false;
-        
-        for (final rule in allRules) {
-          final srcAddress = rule['src-address']?.toString() ?? '';
-          final protocol = rule['protocol']?.toString() ?? '';
-          final dstPort = rule['dst-port']?.toString() ?? '';
-          final comment = rule['comment']?.toString() ?? '';
+      // 3. بلاک QUIC/UDP 443 برای تلگرام و سایر پلتفرم‌ها (اختیاری)
+      if (selectedPlatforms.contains('telegram')) {
+        try {
+          print('[DEBUG] enableSocialMediaFilter: Creating QUIC/UDP 443 blocking rule for Telegram...');
+          final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+          bool quicRuleExists = false;
           
-          if (srcAddress == deviceIp &&
-              protocol == 'udp' &&
-              dstPort == '443' &&
-              comment.contains('Block QUIC')) {
-            quicRuleExists = true;
-            print('[DEBUG] enableSocialMediaFilter: QUIC blocking rule already exists');
-            break;
+          for (final rule in allRawRules) {
+            final srcAddress = rule['src-address']?.toString() ?? '';
+            final protocol = rule['protocol']?.toString() ?? '';
+            final dstPort = rule['dst-port']?.toString() ?? '';
+            final dstList = rule['dst-address-list']?.toString() ?? '';
+            final comment = rule['comment']?.toString() ?? '';
+            
+            if (srcAddress == deviceIp &&
+                protocol == 'udp' &&
+                dstPort == '443' &&
+                dstList == 'Blocked-Social' &&
+                comment.contains('QUIC')) {
+              quicRuleExists = true;
+              print('[DEBUG] enableSocialMediaFilter: QUIC blocking rule already exists');
+              break;
+            }
           }
+          
+          if (!quicRuleExists) {
+            try {
+              await _client!.talk([
+                '/ip/firewall/raw/add',
+                '=chain=prerouting',
+                '=src-address=$deviceIp',
+                '=protocol=udp',
+                '=dst-port=443',
+                '=dst-address-list=Blocked-Social',
+                '=action=drop',
+                '=comment=SM-Filter:Platforms=${selectedPlatforms.join(",")}|Block QUIC UDP443 - Device: ${deviceName ?? deviceIp}',
+              ]);
+              print('[DEBUG] enableSocialMediaFilter: QUIC blocking rule created');
+            } catch (e) {
+              print('[DEBUG] enableSocialMediaFilter: Error creating QUIC blocking rule: $e');
+            }
+          }
+        } catch (e) {
+          print('[DEBUG] enableSocialMediaFilter: Error creating QUIC blocking rule: $e');
         }
-        
-        if (!quicRuleExists) {
-          await _client!.talk([
-            '/ip/firewall/filter/add',
-            '=chain=forward',
-            '=src-address=$deviceIp',
-            '=protocol=udp',
-            '=dst-port=443',
-            '=action=drop',
-            '=comment=SM-Filter:Platforms=${selectedPlatforms.join(",")}|Block QUIC for social media - Device: ${deviceName ?? deviceIp}',
-          ]);
-          print('[DEBUG] enableSocialMediaFilter: QUIC blocking rule created');
-          results['quic_rules_added'] = 1;
-        } else {
-          results['quic_rules_added'] = 0;
-        }
-      } catch (e) {
-        print('[DEBUG] enableSocialMediaFilter: Error creating QUIC blocking rule: $e');
-        results['errors'].add('خطا در ایجاد QUIC blocking rule: $e');
-        results['quic_rules_added'] = 0;
       }
 
       // اگر خطایی رخ داد اما حداقل یک عملیات موفق بود، success را true نگه دار
       if (results['errors'].length > 0 && 
           results['address_list_entries_added'] == 0 &&
-          results['firewall_rules_added'] == 0 &&
-          results['dns_bypass_rules_added'] == 0) {
+          results['raw_rules_added'] == 0) {
         results['success'] = false;
       }
 
@@ -6374,19 +6270,44 @@ class MikroTikService {
       }
 
       // 2. حذف همه Raw Rules مربوط به این دستگاه
+      // شامل: Block social, Block public DNS, Block QUIC
       try {
         final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
         for (final rule in allRawRules) {
           final srcAddress = rule['src-address']?.toString() ?? '';
           final comment = rule['comment']?.toString() ?? '';
+          final dstAddressList = rule['dst-address-list']?.toString() ?? '';
           
-          if (srcAddress == deviceIp && comment.contains('Block social')) {
-            final ruleId = rule['.id']?.toString();
-            if (ruleId != null) {
-              try {
-                await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
-              } catch (e) {
-                // continue
+          if (srcAddress == deviceIp) {
+            bool shouldRemove = false;
+            
+            // حذف rules مربوط به Block social
+            if (comment.contains('Block social') || 
+                comment.contains('SM-Filter') ||
+                dstAddressList == 'Blocked-Social' ||
+                dstAddressList == 'Blocked-Social-IP') {
+              shouldRemove = true;
+            }
+            
+            // حذف rules مربوط به Block public DNS
+            if (comment.contains('Block public DNS')) {
+              shouldRemove = true;
+            }
+            
+            // حذف rules مربوط به Block QUIC
+            if (comment.contains('Block QUIC') || 
+                comment.contains('QUIC UDP443')) {
+              shouldRemove = true;
+            }
+            
+            if (shouldRemove) {
+              final ruleId = rule['.id']?.toString();
+              if (ruleId != null) {
+                try {
+                  await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
+                } catch (e) {
+                  // continue
+                }
               }
             }
           }
@@ -7414,7 +7335,7 @@ class MikroTikService {
       }
 
       // 2. حذف Raw Rules مربوط به این پلتفرم
-      // الگو: مشابه unbanClient - حذف بر اساس IP و dst-address-list (حتی اگر comment خالی باشد)
+      // شامل: Raw Rules برای Address-List و Raw Rules برای QUIC/UDP 443
       try {
         final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
         for (final rule in allRawRules) {
@@ -7423,25 +7344,54 @@ class MikroTikService {
           final dstAddressList = rule['dst-address-list']?.toString() ?? '';
           final action = rule['action']?.toString() ?? '';
           final chain = rule['chain']?.toString() ?? '';
+          final protocol = rule['protocol']?.toString() ?? '';
+          final dstPort = rule['dst-port']?.toString() ?? '';
           
-          // بررسی تطابق IP و dst-address-list (مشابه unbanClient)
-          if (srcAddress == deviceIp && 
-              (dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP') &&
+          if (srcAddress != deviceIp) continue;
+          
+          bool shouldRemove = false;
+          
+          // بررسی Raw Rule برای Address-List (Blocked-Social)
+          if ((dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP') &&
               action == 'drop' &&
               chain == 'prerouting') {
-            bool shouldRemove = false;
-            
             // روش اول: بررسی tag در comment (اگر comment وجود دارد)
             if (comment.isNotEmpty) {
               if (_hasPlatformTag(comment, platformLower)) {
                 shouldRemove = true;
               }
               
+              // بررسی Platforms= در comment (چند پلتفرم)
+              if (!shouldRemove) {
+                final commentLower = comment.toLowerCase();
+                if (commentLower.contains('platforms=') || commentLower.contains('platforms-')) {
+                  // استخراج لیست پلتفرم‌ها
+                  final platformsMatch = RegExp(r'platforms[=-]([^|]+)', caseSensitive: false).firstMatch(comment);
+                  if (platformsMatch != null) {
+                    final platformsStr = platformsMatch.group(1)?.trim() ?? '';
+                    final platformsList = platformsStr.split(',').map((p) => p.trim().toLowerCase()).toList();
+                    if (platformsList.contains(platformLower)) {
+                      // اگر این پلتفرم در لیست است، باید Raw Rule را حذف کنیم
+                      // اما فقط اگر این آخرین پلتفرم است
+                      // برای سادگی، اگر فقط این پلتفرم در لیست است، Raw Rule را حذف می‌کنیم
+                      // در غیر این صورت، Raw Rule را نگه می‌داریم (چون پلتفرم‌های دیگر هنوز فعال هستند)
+                      if (platformsList.length == 1) {
+                        shouldRemove = true;
+                      } else {
+                        // اگر چند پلتفرم وجود دارد، Raw Rule را نگه دار
+                        // فقط Address-List entries مربوط به این پلتفرم حذف می‌شوند
+                        shouldRemove = false;
+                      }
+                    }
+                  }
+                }
+              }
+              
               // Fallback: بررسی کلمات کلیدی (برای rules قدیمی)
               if (!shouldRemove) {
                 final commentLower = comment.toLowerCase();
                 for (final keyword in keywords) {
-                  if (commentLower.contains(keyword) && commentLower.contains('block social')) {
+                  if (commentLower.contains(keyword)) {
                     shouldRemove = true;
                     break;
                   }
@@ -7462,9 +7412,29 @@ class MikroTikService {
                   
                   if (list == dstAddressList) {
                     // تشخیص پلتفرم از IP range
-                    if (address.startsWith('149.154.') || address.startsWith('91.108.')) {
-                      detectedPlatforms.add('telegram');
-                    } else if (address.startsWith('157.240.') || address.startsWith('31.13.') || 
+                    // برای تلگرام: بررسی دقیق‌تر IP ranges
+                    if (address.contains('/')) {
+                      final ipPart = address.split('/')[0];
+                      if (ipPart.startsWith('149.154.160.') || ipPart.startsWith('149.154.162.') ||
+                          ipPart.startsWith('149.154.164.') || ipPart.startsWith('149.154.166.') ||
+                          ipPart.startsWith('149.154.168.') || ipPart.startsWith('149.154.172.') ||
+                          ipPart.startsWith('91.108.4.') || ipPart.startsWith('91.108.8.') ||
+                          ipPart.startsWith('91.108.12.') || ipPart.startsWith('91.108.16.') ||
+                          ipPart.startsWith('91.108.20.') || ipPart.startsWith('91.108.56.')) {
+                        detectedPlatforms.add('telegram');
+                      }
+                    } else {
+                      if (address.startsWith('149.154.160.') || address.startsWith('149.154.162.') ||
+                          address.startsWith('149.154.164.') || address.startsWith('149.154.166.') ||
+                          address.startsWith('149.154.168.') || address.startsWith('149.154.172.') ||
+                          address.startsWith('91.108.4.') || address.startsWith('91.108.8.') ||
+                          address.startsWith('91.108.12.') || address.startsWith('91.108.16.') ||
+                          address.startsWith('91.108.20.') || address.startsWith('91.108.56.')) {
+                        detectedPlatforms.add('telegram');
+                      }
+                    }
+                    
+                    if (address.startsWith('157.240.') || address.startsWith('31.13.') || 
                         address.startsWith('129.134.') || address.startsWith('185.60.216.') ||
                         address.startsWith('66.220.144.') || address.startsWith('69.63.176.')) {
                       detectedPlatforms.add('facebook');
@@ -7516,6 +7486,42 @@ class MikroTikService {
                 try {
                   await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
                   removedCount++;
+                  print('[DEBUG] disablePlatformFilter: Removed Raw Rule for $platformLower: $ruleId');
+                } catch (e) {
+                  // continue
+                }
+              }
+            }
+          }
+          
+          // بررسی Raw Rule برای QUIC/UDP 443 (مخصوص تلگرام)
+          if (platformLower == 'telegram' &&
+              protocol == 'udp' &&
+              dstPort == '443' &&
+              action == 'drop' &&
+              chain == 'prerouting' &&
+              (dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP')) {
+            bool shouldRemoveQuic = false;
+            
+            if (comment.isNotEmpty) {
+              final commentLower = comment.toLowerCase();
+              if (commentLower.contains('telegram') || 
+                  commentLower.contains('quic') ||
+                  _hasPlatformTag(comment, 'telegram')) {
+                shouldRemoveQuic = true;
+              }
+            } else {
+              // اگر comment خالی است، برای اطمینان حذف می‌کنیم
+              shouldRemoveQuic = true;
+            }
+            
+            if (shouldRemoveQuic) {
+              final ruleId = rule['.id']?.toString();
+              if (ruleId != null) {
+                try {
+                  await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
+                  removedCount++;
+                  print('[DEBUG] disablePlatformFilter: Removed QUIC Raw Rule for telegram: $ruleId');
                 } catch (e) {
                   // continue
                 }
@@ -7524,6 +7530,7 @@ class MikroTikService {
           }
         }
       } catch (e) {
+        print('[DEBUG] disablePlatformFilter: Error removing Raw Rules: $e');
         // continue
       }
 
@@ -7587,13 +7594,29 @@ class MikroTikService {
               }
             }
             
-            // برای تلگرام: IP ranges مربوط به AS62041
+            // برای تلگرام: IP ranges مربوط به AS62041 (رنج‌های کامل)
             if (platformLower == 'telegram') {
-              final telegramRanges = ['149.154.160.', '149.154.162.', '149.154.164.', '149.154.166.', '91.108.4.', '91.108.8.', '91.108.12.', '91.108.16.', '91.108.20.', '91.108.56.'];
-              for (final range in telegramRanges) {
-                if (address.startsWith(range) || address.contains(range)) {
-                  shouldRemoveEntry = true;
-                  break;
+              final telegramRanges = [
+                '149.154.160.', '149.154.162.', '149.154.164.', '149.154.166.', 
+                '149.154.168.', '149.154.172.',
+                '91.108.4.', '91.108.8.', '91.108.12.', '91.108.16.', '91.108.20.', '91.108.56.'
+              ];
+              // بررسی IP range (CIDR format)
+              if (address.contains('/')) {
+                final ipPart = address.split('/')[0];
+                for (final range in telegramRanges) {
+                  if (ipPart.startsWith(range)) {
+                    shouldRemoveEntry = true;
+                    break;
+                  }
+                }
+              } else {
+                // بررسی IP مستقیم
+                for (final range in telegramRanges) {
+                  if (address.startsWith(range)) {
+                    shouldRemoveEntry = true;
+                    break;
+                  }
                 }
               }
             }

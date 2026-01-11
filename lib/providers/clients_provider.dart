@@ -17,6 +17,8 @@ class ClientsProvider extends ChangeNotifier {
   bool _isRefreshing = false;
   Map<String, dynamic>? _routerInfo;
   bool _isNewConnectionsLocked = false;
+  // Map برای ذخیره وضعیت Static دستگاه‌ها (key: IP یا MAC, value: bool)
+  final Map<String, bool> _deviceStaticStatus = {};
 
   // Timer برای بررسی دوره‌ای دستگاه‌های جدید (real-time auto-ban)
   Timer? _autoBanCheckTimer;
@@ -187,11 +189,9 @@ class ClientsProvider extends ChangeNotifier {
           
           // بررسی همه دستگاه‌های متصل فعلی
           // هر دستگاهی که MAC یا IP آن در لیست اولیه نیست، باید مسدود شود
-          // همچنین دستگاه‌هایی که non-static هستند باید مسدود شوند (حتی اگر در لیست مجاز هستند)
           // این شامل دستگاه‌هایی می‌شود که:
           // 1. برای اولین بار بعد از فعال شدن قفل وصل شده‌اند
           // 2. قبلاً وصل شده بودند اما disconnect شده‌اند و دوباره وصل شده‌اند
-          // 3. دستگاه‌هایی که non-static هستند (باید همیشه مسدود شوند)
           bool anyDeviceBanned = false;
           for (var client in clientsList.toList()) {
             final clientMac = client.macAddress?.toUpperCase();
@@ -205,44 +205,27 @@ class ClientsProvider extends ChangeNotifier {
               isAllowed = true;
             }
             
-            // اگر دستگاه کاربر نیست، بررسی کن که آیا static است یا نه
-            // دستگاه‌های non-static باید مسدود شوند (حتی اگر در لیست مجاز هستند)
+            // بررسی اینکه آیا دستگاه در لیست مجاز است
             if (!isAllowed && clientIp != null) {
-              bool isStatic = false;
-              try {
-                isStatic = await _serviceManager.isDeviceStatic(
-                  clientIp,
-                  clientMac,
-                );
-              } catch (e) {
-                // اگر نتوانستیم بررسی کنیم، فرض می‌کنیم non-static است
-                isStatic = false;
+              // بررسی MAC
+              if (clientMac != null && clientMac.isNotEmpty) {
+                if (allowedDevices.contains('mac:$clientMac')) {
+                  isAllowed = true;
+                }
               }
               
-              // اگر دستگاه static است، بررسی کن که آیا در لیست مجاز است یا نه
-              // اگر static نیست، مجاز نیست (باید مسدود شود)
-              if (isStatic) {
-                // دستگاه static است - بررسی کن که آیا در لیست مجاز است
-                if (clientMac != null && clientMac.isNotEmpty) {
-                  if (allowedDevices.contains('mac:$clientMac')) {
-                    isAllowed = true;
-                  }
-                }
-                
-                if (!isAllowed && clientIp.isNotEmpty) {
-                  if (allowedDevices.contains('ip:$clientIp')) {
-                    isAllowed = true;
-                  }
+              // بررسی IP
+              if (!isAllowed && clientIp.isNotEmpty) {
+                if (allowedDevices.contains('ip:$clientIp')) {
+                  isAllowed = true;
                 }
               }
-              // اگر non-static است، isAllowed = false (باید مسدود شود)
             }
             
-            // اگر مجاز نیست یا non-static است، مسدود کن و از لیست حذف کن
+            // اگر مجاز نیست، مسدود کن و از لیست حذف کن
             // این شامل دستگاه‌هایی می‌شود که:
             // - برای اولین بار بعد از فعال شدن قفل وصل شده‌اند
             // - قبلاً وصل شده بودند اما disconnect شده‌اند و دوباره وصل شده‌اند
-            // - دستگاه‌هایی که non-static هستند (باید همیشه مسدود شوند)
             if (!isAllowed) {
               bool wasBanned = false;
               try {
@@ -348,6 +331,11 @@ class ClientsProvider extends ChangeNotifier {
       _isDataComplete = dataComplete;
       _isLoading = false;
       _errorMessage = null;
+      
+      // به‌روزرسانی cache وضعیت Static برای دستگاه‌های متصل
+      // این کار به صورت غیرهمزمان انجام می‌شود تا UI را block نکند
+      _updateStaticStatusCache(clientsList);
+      
       notifyListeners();
     } catch (e) {
       _errorMessage = 'خطا در دریافت لیست کاربران: $e';
@@ -486,53 +474,6 @@ class ClientsProvider extends ChangeNotifier {
     }
   }
 
-  /// بررسی اینکه آیا دستگاه static است یا نه
-  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress) async {
-    if (!_serviceManager.isConnected) {
-      return false;
-    }
-
-    try {
-      return await _serviceManager.isDeviceStatic(ipAddress, macAddress);
-    } catch (e) {
-      return false;
-    }
-  }
-
-  /// تبدیل دستگاه به static یا non-static و به‌روزرسانی state
-  Future<bool> setDeviceStaticStatus(
-    String ipAddress,
-    String? macAddress, {
-    String? hostname,
-    bool isStatic = true,
-  }) async {
-    if (!_serviceManager.isConnected) {
-      _errorMessage = 'اتصال برقرار نشده است.';
-      notifyListeners();
-      return false;
-    }
-
-    try {
-      final success = await _serviceManager.setDeviceStaticStatus(
-        ipAddress,
-        macAddress,
-        hostname: hostname,
-        isStatic: isStatic,
-      );
-
-      if (success) {
-        // به‌روزرسانی فوری state
-        await refresh();
-        return true;
-      }
-      return false;
-    } catch (e) {
-      _errorMessage = 'خطا در تبدیل دستگاه: $e';
-      notifyListeners();
-      return false;
-    }
-  }
-
   /// پاک کردن state (برای logout)
   void clear() {
     _cancelAutoBanTimer(); // توقف Timer
@@ -545,6 +486,7 @@ class ClientsProvider extends ChangeNotifier {
     _isRefreshing = false;
     _routerInfo = null;
     _isNewConnectionsLocked = false;
+    _deviceStaticStatus.clear(); // پاک کردن cache وضعیت Static
     notifyListeners();
   }
 
@@ -761,6 +703,161 @@ class ClientsProvider extends ChangeNotifier {
       _errorMessage = 'خطا در تغییر وضعیت فیلتر: $e';
       notifyListeners();
       return {'success': false, 'error': _errorMessage};
+    }
+  }
+
+  /// بررسی اینکه آیا دستگاه Static است یا نه
+  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress, {String? hostname}) async {
+    print('[STATIC] ClientsProvider.isDeviceStatic: شروع');
+    print('[STATIC] IP: $ipAddress, MAC: $macAddress, hostname: $hostname');
+    print('[STATIC] isConnected: ${_serviceManager.isConnected}');
+    
+    // ابتدا از cache بررسی کن
+    String? cacheKey;
+    if (ipAddress != null && ipAddress.isNotEmpty) {
+      cacheKey = 'ip:$ipAddress';
+      if (_deviceStaticStatus.containsKey(cacheKey)) {
+        final cached = _deviceStaticStatus[cacheKey]!;
+        print('[STATIC] ClientsProvider.isDeviceStatic: از cache: $cached (key: $cacheKey)');
+        return cached;
+      }
+    }
+    if (macAddress != null && macAddress.isNotEmpty) {
+      cacheKey = 'mac:${macAddress.toUpperCase()}';
+      if (_deviceStaticStatus.containsKey(cacheKey)) {
+        final cached = _deviceStaticStatus[cacheKey]!;
+        print('[STATIC] ClientsProvider.isDeviceStatic: از cache: $cached (key: $cacheKey)');
+        return cached;
+      }
+    }
+    // بررسی cache با hostname (برای حالتی که MAC تغییر کرده)
+    if (hostname != null && hostname.isNotEmpty) {
+      cacheKey = 'hostname:${hostname.toLowerCase().trim()}';
+      if (_deviceStaticStatus.containsKey(cacheKey)) {
+        final cached = _deviceStaticStatus[cacheKey]!;
+        print('[STATIC] ClientsProvider.isDeviceStatic: از cache: $cached (key: $cacheKey)');
+        return cached;
+      }
+    }
+    
+    if (!_serviceManager.isConnected) {
+      print('[STATIC] ClientsProvider.isDeviceStatic: اتصال برقرار نیست');
+      return false;
+    }
+
+    try {
+      print('[STATIC] ClientsProvider.isDeviceStatic: فراخوانی serviceManager.isDeviceStatic');
+      final result = await _serviceManager.isDeviceStatic(ipAddress, macAddress, hostname: hostname);
+      print('[STATIC] ClientsProvider.isDeviceStatic: نتیجه از سرور: $result');
+      
+      // ذخیره در cache
+      if (ipAddress != null && ipAddress.isNotEmpty) {
+        _deviceStaticStatus['ip:$ipAddress'] = result;
+        print('[STATIC] ClientsProvider.isDeviceStatic: ذخیره در cache: ip:$ipAddress = $result');
+      }
+      if (macAddress != null && macAddress.isNotEmpty) {
+        _deviceStaticStatus['mac:${macAddress.toUpperCase()}'] = result;
+        print('[STATIC] ClientsProvider.isDeviceStatic: ذخیره در cache: mac:${macAddress.toUpperCase()} = $result');
+      }
+      if (hostname != null && hostname.isNotEmpty) {
+        _deviceStaticStatus['hostname:${hostname.toLowerCase().trim()}'] = result;
+        print('[STATIC] ClientsProvider.isDeviceStatic: ذخیره در cache: hostname:${hostname.toLowerCase().trim()} = $result');
+      }
+      
+      return result;
+    } catch (e) {
+      print('[STATIC] ClientsProvider.isDeviceStatic: خطا: $e');
+      print('[STATIC] Stack trace: ${StackTrace.current}');
+      return false;
+    }
+  }
+
+  /// تبدیل دستگاه به Static یا غیر Static
+  Future<bool> setDeviceStaticStatus(
+    String ipAddress,
+    String? macAddress, {
+    String? hostname,
+    bool isStatic = true,
+  }) async {
+    print('[STATIC] ClientsProvider.setDeviceStaticStatus: شروع');
+    print('[STATIC] IP: $ipAddress, MAC: $macAddress, hostname: $hostname, isStatic: $isStatic');
+    print('[STATIC] isConnected: ${_serviceManager.isConnected}');
+    
+    if (!_serviceManager.isConnected) {
+      print('[STATIC] ClientsProvider.setDeviceStaticStatus: اتصال برقرار نیست');
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return false;
+    }
+
+    try {
+      print('[STATIC] ClientsProvider.setDeviceStaticStatus: فراخوانی serviceManager.setDeviceStaticStatus');
+      final success = await _serviceManager.setDeviceStaticStatus(
+        ipAddress,
+        macAddress,
+        hostname: hostname,
+        isStatic: isStatic,
+      );
+
+      print('[STATIC] ClientsProvider.setDeviceStaticStatus: نتیجه: $success');
+
+      if (success) {
+        print('[STATIC] ClientsProvider.setDeviceStaticStatus: موفق بود، به‌روزرسانی cache');
+        
+        // به‌روزرسانی cache
+        _deviceStaticStatus['ip:$ipAddress'] = isStatic;
+        print('[STATIC] ClientsProvider.setDeviceStaticStatus: به‌روزرسانی cache: ip:$ipAddress = $isStatic');
+        if (macAddress != null && macAddress.isNotEmpty) {
+          _deviceStaticStatus['mac:${macAddress.toUpperCase()}'] = isStatic;
+          print('[STATIC] ClientsProvider.setDeviceStaticStatus: به‌روزرسانی cache: mac:${macAddress.toUpperCase()} = $isStatic');
+        }
+        
+        notifyListeners();
+        
+        print('[STATIC] ClientsProvider.setDeviceStaticStatus: refresh می‌کنم');
+        await refresh();
+        return true;
+      } else {
+        print('[STATIC] ClientsProvider.setDeviceStaticStatus: ناموفق بود');
+      }
+      return false;
+    } catch (e) {
+      print('[STATIC] ClientsProvider.setDeviceStaticStatus: خطا: $e');
+      print('[STATIC] Stack trace: ${StackTrace.current}');
+      _errorMessage = 'خطا در تغییر وضعیت Static: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// به‌روزرسانی cache وضعیت Static برای لیست دستگاه‌ها
+  /// این متد به صورت غیرهمزمان وضعیت Static را از سرور می‌گیرد و در cache ذخیره می‌کند
+  Future<void> _updateStaticStatusCache(List<ClientInfo> clients) async {
+    if (!_serviceManager.isConnected || clients.isEmpty) {
+      return;
+    }
+
+    // فقط برای دستگاه‌هایی که IP دارند
+    for (var client in clients) {
+      if (client.ipAddress != null && client.ipAddress!.isNotEmpty) {
+        final ip = client.ipAddress!;
+        final mac = client.macAddress;
+        
+        // اگر در cache نیست، از سرور بگیر
+        final cacheKey = 'ip:$ip';
+        if (!_deviceStaticStatus.containsKey(cacheKey)) {
+          try {
+            final isStatic = await _serviceManager.isDeviceStatic(ip, mac);
+            _deviceStaticStatus[cacheKey] = isStatic;
+            if (mac != null && mac.isNotEmpty) {
+              _deviceStaticStatus['mac:${mac.toUpperCase()}'] = isStatic;
+            }
+            print('[STATIC] ClientsProvider._updateStaticStatusCache: به‌روزرسانی cache برای $ip = $isStatic');
+          } catch (e) {
+            // ignore errors - cache optional است
+          }
+        }
+      }
     }
   }
 

@@ -140,15 +140,15 @@ class MikroTikServiceManager {
     return await _service!.getAllowedIpsForLock();
   }
 
-  /// بررسی اینکه آیا دستگاه static است یا نه
-  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress) async {
+  /// بررسی اینکه آیا دستگاه Static است یا نه
+  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress, {String? hostname}) async {
     if (_service == null || !isConnected) {
       return false;
     }
-    return await _service!.isDeviceStatic(ipAddress, macAddress);
+    return await _service!.isDeviceStatic(ipAddress, macAddress, hostname: hostname);
   }
 
-  /// تبدیل دستگاه به static یا non-static
+  /// تبدیل دستگاه به Static یا غیر Static
   Future<bool> setDeviceStaticStatus(
     String ipAddress,
     String? macAddress, {
@@ -165,5 +165,6 @@ class MikroTikServiceManager {
       isStatic: isStatic,
     );
   }
+
 }
 

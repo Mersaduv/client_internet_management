@@ -3,9 +3,9 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:provider/provider.dart';
 import 'screens/login_screen.dart';
 import 'screens/connection_test_screen.dart';
-import 'screens/settings_screen.dart';
 import 'screens/device_detail_screen.dart';
 import 'screens/internet_service_screen.dart';
+import 'screens/app_settings_screen.dart';
 import 'services/mikrotik_service_manager.dart';
 import 'services/settings_service.dart';
 import 'models/client_info.dart';
@@ -115,28 +115,9 @@ class _MainScaffoldState extends State<MainScaffold> {
   }
 
   void _onTabTapped(int index) {
-    if (index == 3) {
-      // خروج
-      _handleLogout();
-    } else if (index < 3) {
-      setState(() {
-        _currentIndex = index;
-      });
-    }
-  }
-
-  Future<void> _handleLogout() async {
-    final provider = Provider.of<ClientsProvider>(context, listen: false);
-    provider.clear();
-    _serviceManager.disconnect();
-    
-    // پاک کردن زمان لاگین
-    final settingsService = SettingsService();
-    await settingsService.clearLoginTimestamp();
-    
-    if (mounted) {
-      Navigator.of(context).pushReplacementNamed('/');
-    }
+    setState(() {
+      _currentIndex = index;
+    });
   }
 
   @override
@@ -147,7 +128,7 @@ class _MainScaffoldState extends State<MainScaffold> {
         children: const [
           HomePage(),
           InternetServiceScreen(),
-          SettingsScreen(),
+          AppSettingsScreen(),
         ],
       ),
       bottomNavigationBar: Container(
@@ -188,13 +169,6 @@ class _MainScaffoldState extends State<MainScaffold> {
                   label: 'تنظیمات',
                   index: 2,
                   isActive: _currentIndex == 2,
-                ),
-                _buildNavItem(
-                  icon: Icons.logout_outlined,
-                  activeIcon: Icons.logout,
-                  label: 'خروج',
-                  index: 3,
-                  isActive: false,
                 ),
               ],
             ),

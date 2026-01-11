@@ -21,27 +21,71 @@ class DeviceDetailScreen extends StatefulWidget {
   State<DeviceDetailScreen> createState() => _DeviceDetailScreenState();
 }
 
-class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
+class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBindingObserver {
   final MikroTikServiceManager _serviceManager = MikroTikServiceManager();
   bool _isLoading = false;
   String? _speedLimit;
-  bool? _isStatic;
-  bool? _isSocialMediaFiltered;
-  Map<String, bool> _platformFilterStatus = {
-    'telegram': false,
-    'facebook': false,
-  };
+  // Telegram 功能已禁用，以下字段保留用于将来的平台支持
+  // ignore: unused_field
+  Map<String, bool> _platformFilterStatus = {};
   bool _isLoadingStatus = false; // برای جلوگیری از race condition
+  bool? _isStatic;
+  bool _isLoadingStatic = false;
+  bool _hasLoadedOnce = false; // برای بررسی اینکه آیا یک بار بارگذاری شده است
+  bool _isDialogOpen = false; // برای جلوگیری از بررسی وضعیت در حین نمایش Dialog
 
   static const Color _primaryColor = Color(0xFF428B7C);
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Reset همه state ها برای اطمینان از بارگذاری مجدد
+    _isStatic = null;
+    _isLoadingStatic = false;
+    _speedLimit = null;
+    _hasLoadedOnce = false;
     // بارگذاری اطلاعات به صورت غیرهمزمان و بدون blocking کردن UI
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadAllData();
+      _hasLoadedOnce = true;
     });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    // وقتی اپلیکیشن از background به foreground برمی‌گردد، وضعیت را دوباره بررسی کن
+    if (state == AppLifecycleState.resumed && _hasLoadedOnce && mounted) {
+      _checkStaticStatus();
+    }
+  }
+
+  @override
+  void didUpdateWidget(DeviceDetailScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // اگر دستگاه تغییر کرد یا IP/MAC تغییر کرد، داده‌ها را دوباره بارگذاری کن
+    if (oldWidget.device.ipAddress != widget.device.ipAddress ||
+        oldWidget.device.macAddress != widget.device.macAddress ||
+        oldWidget.isBanned != widget.isBanned) {
+      _isStatic = null;
+      _isLoadingStatic = false;
+      _speedLimit = null;
+      _loadAllData();
+    } else {
+      // حتی اگر دستگاه تغییر نکرده باشد، وضعیت Static را دوباره بررسی کن
+      // این برای اطمینان از به‌روز بودن وضعیت است
+      // اما فقط اگر Dialog باز نیست
+      if (widget.device.ipAddress != null && !widget.isBanned && !_isDialogOpen) {
+        _checkStaticStatus();
+      }
+    }
   }
 
   /// بارگذاری همه داده‌ها به صورت همزمان و صبر برای تمام شدن
@@ -54,10 +98,9 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
       await Future.wait([
         _loadSpeedLimit(),
         _checkStaticStatus(),
-        _checkSocialMediaFilterStatus(),
       ]);
     } catch (e) {
-      print('[DEBUG] Error loading data: $e');
+      print('[STATIC] _loadAllData: خطا در بارگذاری داده‌ها: $e');
     } finally {
       if (mounted) {
         setState(() {
@@ -67,186 +110,12 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
     }
   }
 
-  Future<void> _checkSocialMediaFilterStatus() async {
-    if (widget.device.ipAddress == null || widget.isBanned) {
-      print('[DEBUG] _checkSocialMediaFilterStatus: Skipping - IP: ${widget.device.ipAddress}, isBanned: ${widget.isBanned}');
-      return;
-    }
-
-    print('[DEBUG] _checkSocialMediaFilterStatus: Starting for device ${widget.device.ipAddress}');
-    try {
-      final provider = Provider.of<ClientsProvider>(context, listen: false);
-      final status = await provider.getSocialMediaFilterStatus(widget.device.ipAddress!);
-      print('[DEBUG] _checkSocialMediaFilterStatus: Received status: $status');
-      if (mounted) {
-        setState(() {
-          _isSocialMediaFiltered = status['is_active'] == true;
-          final platforms = status['platforms'] as Map<String, dynamic>?;
-          print('[DEBUG] _checkSocialMediaFilterStatus: is_active: ${status['is_active']}, platforms: $platforms');
-          if (platforms != null) {
-            // به‌روزرسانی فقط اگر داده معتبر است
-            _platformFilterStatus = {
-              'telegram': platforms['telegram'] == true,
-              'facebook': platforms['facebook'] == true,
-            };
-            print('[DEBUG] _checkSocialMediaFilterStatus: Updated _platformFilterStatus: $_platformFilterStatus');
-          } else {
-            print('[DEBUG] _checkSocialMediaFilterStatus: platforms is null');
-            // اگر platforms null است، همه را false کن
-            _platformFilterStatus = {
-              'telegram': false,
-              'facebook': false,
-            };
-          }
-        });
-      } else {
-        print('[DEBUG] _checkSocialMediaFilterStatus: Widget not mounted, skipping setState');
-      }
-    } catch (e) {
-      print('[DEBUG] _checkSocialMediaFilterStatus: Error: $e');
-      // در صورت خطا، وضعیت را null نگه دار (ناشناخته)
-      if (mounted) {
-        setState(() {
-          _isSocialMediaFiltered = null;
-          // در صورت خطا، همه را false کن
-          _platformFilterStatus = {
-            'telegram': false,
-            'facebook': false,
-          };
-        });
-      }
-    }
-  }
-
+  // Telegram 功能已禁用，以下函数保留用于将来的平台支持
+  // ignore: unused_element
   Future<void> _togglePlatformFilter(String platform, String platformName) async {
-    if (widget.device.ipAddress == null || widget.isBanned || _isLoading) return;
-
-    final isCurrentlyFiltered = _platformFilterStatus[platform] == true;
-    final actionText = isCurrentlyFiltered ? 'رفع فیلتر' : 'فیلتر کردن';
-    final message = isCurrentlyFiltered
-        ? 'آیا مطمئن هستید که می‌خواهید فیلتر $platformName را برای دستگاه ${widget.device.ipAddress} بردارید؟'
-        : 'آیا مطمئن هستید که می‌خواهید $platformName را برای دستگاه ${widget.device.ipAddress} فیلتر کنید؟';
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(actionText),
-        content: Text(message),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('لغو'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: isCurrentlyFiltered ? Colors.green : Colors.orange,
-              foregroundColor: Colors.white,
-            ),
-            child: Text(actionText),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed == true) {
-      setState(() {
-        _isLoading = true;
-      });
-
-      try {
-        final provider = Provider.of<ClientsProvider>(context, listen: false);
-        final result = await provider.togglePlatformFilter(
-          widget.device.ipAddress!,
-          platform,
-          deviceMac: widget.device.macAddress,
-          deviceName: widget.device.hostName ?? widget.device.name,
-          enable: !isCurrentlyFiltered,
-        );
-
-        if (mounted) {
-          if (result['success'] == true) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  isCurrentlyFiltered
-                      ? 'فیلتر $platformName با موفقیت برداشته شد'
-                      : 'فیلتر $platformName با موفقیت فعال شد',
-                ),
-                backgroundColor: Colors.green,
-              ),
-            );
-            // به‌روزرسانی فوری وضعیت UI قبل از بررسی مجدد
-            setState(() {
-              _platformFilterStatus[platform] = !isCurrentlyFiltered;
-            });
-            // بررسی مجدد وضعیت از سرور با تاخیر کوتاه (برای اطمینان از به‌روزرسانی سرور)
-            // چند بار بررسی کن تا مطمئن شویم که وضعیت درست است
-            Future.delayed(const Duration(milliseconds: 500), () {
-              if (mounted) {
-                _checkSocialMediaFilterStatus();
-              }
-            });
-            Future.delayed(const Duration(milliseconds: 1500), () {
-              if (mounted) {
-                _checkSocialMediaFilterStatus();
-              }
-            });
-            await _checkSocialMediaFilterStatus();
-          } else {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('خطا: ${result['error'] ?? "خطا در تغییر وضعیت فیلتر"}'),
-                backgroundColor: Colors.red,
-              ),
-            );
-          }
-        }
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('خطا: $e'),
-              backgroundColor: Colors.red,
-            ),
-          );
-        }
-      } finally {
-        if (mounted) {
-          setState(() {
-            _isLoading = false;
-          });
-        }
-      }
-    }
-  }
-
-  Future<void> _checkStaticStatus() async {
-    if (widget.device.ipAddress == null || widget.isBanned) {
-      return;
-    }
-
-    try {
-      final isStatic = await _serviceManager.isDeviceStatic(
-        widget.device.ipAddress,
-        widget.device.macAddress,
-      ).timeout(
-        const Duration(seconds: 5),
-        onTimeout: () => false,
-      );
-      if (mounted) {
-        setState(() {
-          _isStatic = isStatic;
-        });
-      }
-    } catch (e) {
-      // در صورت خطا، وضعیت را null نگه دار (ناشناخته)
-      if (mounted) {
-        setState(() {
-          _isStatic = null;
-        });
-      }
-    }
+    // Telegram 功能已被禁用，只保留 UI
+    if (platform == 'telegram') return;
+    // 此函数保留用于将来的平台支持
   }
 
   Future<void> _loadSpeedLimit() async {
@@ -288,6 +157,243 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
           _speedLimit = 'N/A';
         });
       }
+    }
+  }
+
+  Future<void> _checkStaticStatus() async {
+    // اگر Dialog باز است، بررسی وضعیت را انجام نده
+    if (_isDialogOpen) {
+      print('[STATIC] _checkStaticStatus: Dialog باز است، بررسی را رد می‌کنم');
+      return;
+    }
+
+    print('[STATIC] _checkStaticStatus: شروع بررسی وضعیت Static');
+    print('[STATIC] IP: ${widget.device.ipAddress}, MAC: ${widget.device.macAddress}, isBanned: ${widget.isBanned}');
+    
+    if (widget.device.ipAddress == null || widget.isBanned) {
+      print('[STATIC] _checkStaticStatus: رد شد - IP یا isBanned null است');
+      if (mounted) {
+        setState(() {
+          _isStatic = null;
+          _isLoadingStatic = false;
+        });
+      }
+      return;
+    }
+
+    // اگر در حال بارگذاری است، صبر کن
+    if (_isLoadingStatic) {
+      print('[STATIC] _checkStaticStatus: در حال بارگذاری است، صبر می‌کنم...');
+      await Future.delayed(const Duration(milliseconds: 100));
+      if (_isLoadingStatic) {
+        print('[STATIC] _checkStaticStatus: هنوز در حال بارگذاری است، بازگشت');
+        return;
+      }
+    }
+
+    _isLoadingStatic = true;
+    print('[STATIC] _checkStaticStatus: شروع بررسی از Provider');
+
+    try {
+      final provider = Provider.of<ClientsProvider>(context, listen: false);
+      print('[STATIC] _checkStaticStatus: فراخوانی provider.isDeviceStatic');
+      final isStatic = await provider.isDeviceStatic(
+        widget.device.ipAddress,
+        widget.device.macAddress,
+        hostname: widget.device.hostName ?? widget.device.name,
+      );
+      
+      print('[STATIC] _checkStaticStatus: نتیجه بررسی: $isStatic');
+      
+      if (mounted) {
+        setState(() {
+          _isStatic = isStatic;
+          _isLoadingStatic = false;
+        });
+        print('[STATIC] _checkStaticStatus: State به‌روزرسانی شد: _isStatic = $isStatic');
+      } else {
+        print('[STATIC] _checkStaticStatus: Widget mounted نیست، State به‌روزرسانی نشد');
+      }
+    } catch (e) {
+      print('[STATIC] _checkStaticStatus: خطا در بررسی وضعیت Static: $e');
+      print('[STATIC] _checkStaticStatus: Stack trace: ${StackTrace.current}');
+      if (mounted) {
+        setState(() {
+          _isStatic = null;
+          _isLoadingStatic = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _toggleStaticStatus() async {
+    print('[STATIC] _toggleStaticStatus: شروع تغییر وضعیت Static');
+    print('[STATIC] IP: ${widget.device.ipAddress}, MAC: ${widget.device.macAddress}');
+    print('[STATIC] وضعیت فعلی: _isStatic = $_isStatic, _isLoading = $_isLoading');
+    
+    if (widget.device.ipAddress == null || widget.isBanned || _isLoading) {
+      print('[STATIC] _toggleStaticStatus: رد شد - IP: ${widget.device.ipAddress}, isBanned: ${widget.isBanned}, isLoading: $_isLoading');
+      return;
+    }
+
+    // ذخیره وضعیت فعلی قبل از نمایش Dialog
+    final isCurrentlyStatic = _isStatic == true;
+    print('[STATIC] _toggleStaticStatus: وضعیت فعلی Static (ذخیره شده): $isCurrentlyStatic');
+    
+    // تنظیم flag برای جلوگیری از بررسی وضعیت در حین نمایش Dialog
+    setState(() {
+      _isDialogOpen = true;
+    });
+
+    final actionText = isCurrentlyStatic ? 'تبدیل به غیر Static' : 'تبدیل به Static';
+    final message = isCurrentlyStatic
+        ? 'آیا مطمئن هستید که می‌خواهید دستگاه ${widget.device.ipAddress} را به غیر Static تبدیل کنید؟\n\n'
+            'بعد از تبدیل به غیر Static:\n'
+            '• IP دستگاه ممکن است تغییر کند\n'
+            '• دستگاه به صورت Dynamic شناسایی می‌شود'
+        : 'آیا مطمئن هستید که می‌خواهید دستگاه ${widget.device.ipAddress} را به Static تبدیل کنید؟\n\n'
+            'بعد از تبدیل به Static:\n'
+            '• IP دستگاه ثابت می‌ماند\n'
+            '• MAC Address ثابت می‌ماند\n'
+            '• دستگاه همیشه با همان IP شناسایی می‌شود';
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(actionText),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('لغو'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isCurrentlyStatic ? Colors.orange : _primaryColor,
+              foregroundColor: Colors.white,
+            ),
+            child: Text(actionText),
+          ),
+        ],
+      ),
+    );
+
+    // بستن flag بعد از بسته شدن Dialog
+    if (mounted) {
+      setState(() {
+        _isDialogOpen = false;
+      });
+    }
+
+    if (confirmed == true) {
+      print('[STATIC] _toggleStaticStatus: کاربر تایید کرد، شروع تغییر وضعیت');
+      setState(() {
+        _isLoading = true;
+        _isDialogOpen = true; // جلوگیری از بررسی وضعیت در حین عملیات
+      });
+
+      try {
+        final provider = Provider.of<ClientsProvider>(context, listen: false);
+        print('[STATIC] _toggleStaticStatus: فراخوانی provider.setDeviceStaticStatus');
+        print('[STATIC] پارامترها: IP=${widget.device.ipAddress}, MAC=${widget.device.macAddress}, isStatic=${!isCurrentlyStatic}');
+        
+        final success = await provider.setDeviceStaticStatus(
+          widget.device.ipAddress!,
+          widget.device.macAddress,
+          hostname: widget.device.hostName ?? widget.device.name,
+          isStatic: !isCurrentlyStatic,
+        );
+
+        print('[STATIC] _toggleStaticStatus: نتیجه تغییر وضعیت: $success');
+
+        if (mounted) {
+          if (success) {
+            print('[STATIC] _toggleStaticStatus: تغییر وضعیت موفق بود');
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Row(
+                  children: [
+                    const Icon(Icons.check_circle, color: Colors.white),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        isCurrentlyStatic
+                            ? 'دستگاه با موفقیت به غیر Static تبدیل شد'
+                            : 'دستگاه با موفقیت به Static تبدیل شد',
+                      ),
+                    ),
+                  ],
+                ),
+                backgroundColor: Colors.green,
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+            // به‌روزرسانی فوری وضعیت بدون بررسی مجدد از سرور
+            setState(() {
+              _isStatic = !isCurrentlyStatic;
+            });
+            // بررسی مجدد وضعیت Static بعد از تغییر (با تاخیر)
+            print('[STATIC] _toggleStaticStatus: صبر 1000ms و سپس بررسی مجدد وضعیت');
+            await Future.delayed(const Duration(milliseconds: 1000));
+            // بستن flag قبل از بررسی مجدد
+            if (mounted) {
+              setState(() {
+                _isDialogOpen = false;
+              });
+            }
+            await _checkStaticStatus();
+          } else {
+            print('[STATIC] _toggleStaticStatus: تغییر وضعیت ناموفق بود');
+            print('[STATIC] خطا: ${provider.errorMessage ?? "خطای نامشخص"}');
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Row(
+                  children: [
+                    const Icon(Icons.error, color: Colors.white),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'خطا: ${provider.errorMessage ?? "خطا در تغییر وضعیت Static"}',
+                      ),
+                    ),
+                  ],
+                ),
+                backgroundColor: Colors.red,
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          }
+        }
+      } catch (e) {
+        print('[STATIC] _toggleStaticStatus: خطا در تغییر وضعیت: $e');
+        print('[STATIC] Stack trace: ${StackTrace.current}');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  const Icon(Icons.error, color: Colors.white),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text('خطا: $e')),
+                ],
+              ),
+              backgroundColor: Colors.red,
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        }
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+            _isDialogOpen = false; // اطمینان از بسته شدن flag
+          });
+          print('[STATIC] _toggleStaticStatus: _isLoading = false, _isDialogOpen = false');
+        }
+      }
+    } else {
+      print('[STATIC] _toggleStaticStatus: کاربر لغو کرد');
     }
   }
 
@@ -911,98 +1017,20 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
     }
   }
 
-  Future<void> _toggleStaticStatus() async {
-    if (widget.device.ipAddress == null) return;
-
-    final isCurrentlyStatic = _isStatic == true;
-    final actionText = isCurrentlyStatic ? 'غیر ثابت' : 'ثابت';
-    final message = isCurrentlyStatic
-        ? 'آیا مطمئن هستید که می‌خواهید دستگاه ${widget.device.ipAddress} را غیر ثابت کنید؟\n\nاین کار باعث می‌شود که:\n• دستگاه از لیست مجاز حذف شود\n• اگر قفل اتصال فعال باشد، دستگاه نمی‌تواند متصل شود\n• دستگاه به عنوان دستگاه جدید شناسایی شود'
-        : 'آیا مطمئن هستید که می‌خواهید دستگاه ${widget.device.ipAddress} را ثابت کنید؟\n\nاین کار باعث می‌شود که:\n• دستگاه به لیست مجاز اضافه شود\n• IP دستگاه ثابت بماند\n• اگر قفل اتصال فعال باشد، دستگاه می‌تواند متصل شود';
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('تبدیل به $actionText'),
-        content: Text(message),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('لغو'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: isCurrentlyStatic ? Colors.orange : _primaryColor,
-              foregroundColor: Colors.white,
-            ),
-            child: Text('تبدیل به $actionText'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed == true) {
-      setState(() {
-        _isLoading = true;
-      });
-
-      try {
-        final provider = Provider.of<ClientsProvider>(context, listen: false);
-        final success = await provider.setDeviceStaticStatus(
-          widget.device.ipAddress!,
-          widget.device.macAddress,
-          hostname: widget.device.hostName,
-          isStatic: !isCurrentlyStatic,
-        );
-
-        if (mounted) {
-          if (success) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'دستگاه با موفقیت به $actionText تبدیل شد',
-                ),
-                backgroundColor: Colors.green,
-              ),
-            );
-            // به‌روزرسانی وضعیت static
-            await _checkStaticStatus();
-            setState(() {
-              _isLoading = false;
-            });
-            // به‌روزرسانی لیست
-            Navigator.pop(context, true);
-          } else {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('خطا: ${provider.errorMessage ?? "خطا در تبدیل دستگاه"}'),
-                backgroundColor: Colors.red,
-              ),
-            );
-            setState(() {
-              _isLoading = false;
-            });
-          }
-        }
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('خطا: $e'),
-              backgroundColor: Colors.red,
-            ),
-          );
-          setState(() {
-            _isLoading = false;
-          });
-        }
-      }
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
+    // هر بار که build فراخوانی می‌شود، اگر وضعیت Static null است و شرایط مناسب است، بررسی کن
+    // این برای حالتی است که کاربر از صفحه خارج شده و دوباره وارد شده است
+    // اما فقط اگر Dialog باز نیست
+    if (_isStatic == null && !_isLoadingStatic && !_isLoadingStatus && !_isDialogOpen &&
+        widget.device.ipAddress != null && !widget.isBanned) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _isStatic == null && !_isLoadingStatic && !_isDialogOpen) {
+          _checkStaticStatus();
+        }
+      });
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('جزئیات دستگاه'),
@@ -1114,6 +1142,13 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                           _buildInfoRow('آدرس IP', widget.device.ipAddress!),
                         if (widget.device.macAddress != null)
                           _buildInfoRow('آدرس MAC', widget.device.macAddress!),
+                        if (_isStatic != null && !widget.isBanned)
+                          _buildInfoRow(
+                            'وضعیت IP',
+                            _isStatic == true
+                                ? 'Static (ثابت)'
+                                : 'Dynamic (پویا)',
+                          ),
                         if (widget.device.hostName != null)
                           _buildInfoRow('نام میزبان', widget.device.hostName!),
                         if (widget.device.uptime != null)
@@ -1149,74 +1184,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                             ),
                           )
                         else ...[
-                          // نمایش وضعیت static - فقط برای دستگاه‌های ثابت
-                          if (_isStatic == true)
-                            Container(
-                              padding: const EdgeInsets.all(12),
-                              margin: const EdgeInsets.only(top: 8),
-                              decoration: BoxDecoration(
-                                color: Colors.green.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: Colors.green.withOpacity(0.3),
-                                ),
-                              ),
-                              child: Row(
-                                children: [
-                                  const Icon(
-                                    Icons.check_circle,
-                                    color: Colors.green,
-                                    size: 20,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      'این دستگاه ثابت است (می‌تواند همیشه متصل شود)',
-                                      style: const TextStyle(
-                                        color: Colors.green,
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 13,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
                           if (_speedLimit != null && _speedLimit != 'N/A')
                             _buildSpeedInfoRow(_speedLimit!),
-                          // نمایش وضعیت فیلتر شبکه‌های اجتماعی
-                          if (_isSocialMediaFiltered == true)
-                            Container(
-                              padding: const EdgeInsets.all(12),
-                              margin: const EdgeInsets.only(top: 8),
-                              decoration: BoxDecoration(
-                                color: Colors.orange.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: Colors.orange.withOpacity(0.3),
-                                ),
-                              ),
-                              child: Row(
-                                children: [
-                                  const Icon(
-                                    Icons.filter_alt,
-                                    color: Colors.orange,
-                                    size: 20,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      'فیلتر Telegram فعال است',
-                                      style: const TextStyle(
-                                        color: Colors.orange,
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 13,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
                         ],
                       ],
                     ),
@@ -1255,47 +1224,25 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                           ),
                         ),
                         const SizedBox(height: 12),
-                        // دکمه تبدیل به static/non-static (فقط برای دستگاه‌های غیرمسدود)
                         if (!widget.isBanned)
-                          LayoutBuilder(
-                            builder: (context, constraints) {
-                              final isWide = constraints.maxWidth > 400;
-                              return ElevatedButton.icon(
-                                onPressed: _isLoading ? null : _toggleStaticStatus,
-                                icon: Icon(
-                                  _isStatic == true 
-                                      ? Icons.check_circle 
-                                      : Icons.radio_button_unchecked,
-                                  size: isWide ? 24 : 20,
-                                ),
-                                label: Text(
-                                  _isStatic == true 
-                                      ? 'تبدیل به غیر Static' 
-                                      : 'تبدیل به Static',
-                                  style: TextStyle(
-                                    fontSize: isWide ? 18 : 16,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: _isStatic == true 
-                                      ? Colors.orange 
-                                      : _primaryColor,
-                                  foregroundColor: Colors.white,
-                                  disabledBackgroundColor: Colors.grey.shade300,
-                                  padding: EdgeInsets.symmetric(
-                                    vertical: isWide ? 16 : 14,
-                                    horizontal: isWide ? 24 : 16,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                  elevation: 2,
-                                ),
-                              );
-                            },
+                          ElevatedButton.icon(
+                            onPressed: _isLoading ? null : _toggleStaticStatus,
+                            icon: Icon(_isStatic == true ? Icons.lock : Icons.lock_open),
+                            label: Text(
+                              _isStatic == true ? 'تبدیل به غیر Static' : 'تبدیل به Static',
+                              style: const TextStyle(fontSize: 20),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: _isStatic == true ? Colors.orange : Colors.blue,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 16),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              disabledBackgroundColor: Colors.grey,
+                            ),
                           ),
-                        const SizedBox(height: 12),
+                        if (!widget.isBanned) const SizedBox(height: 12),
                         if (widget.isBanned)
                           ElevatedButton.icon(
                             onPressed: _unbanDevice,
@@ -1377,41 +1324,36 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
     ];
 
     return platforms.map((platform) {
-      final key = platform['key'] as String;
       final name = platform['name'] as String;
       final icon = platform['icon'] as IconData;
       final color = platform['color'] as Color;
-      final isFiltered = _platformFilterStatus[key] == true;
+      final isFiltered = false; // Telegram 功能已禁用，状态固定为 false
 
       return Container(
         margin: const EdgeInsets.only(bottom: 12),
         decoration: BoxDecoration(
-          color: isFiltered ? color.withOpacity(0.1) : Colors.grey.shade50,
+          color: Colors.grey.shade50,
           borderRadius: BorderRadius.circular(8),
           border: Border.all(
-            color: isFiltered ? color : Colors.grey.shade300,
-            width: isFiltered ? 2 : 1,
+            color: Colors.grey.shade300,
+            width: 1,
           ),
         ),
         child: ListTile(
-          leading: Icon(icon, color: isFiltered ? color : Colors.grey),
+          leading: Icon(icon, color: Colors.grey),
           title: Text(
             name,
             style: TextStyle(
               fontWeight: FontWeight.w600,
-              color: isFiltered ? color : Colors.black87,
+              color: Colors.black87,
             ),
           ),
           trailing: Switch(
             value: isFiltered,
-            onChanged: _isLoading
-                ? null
-                : (value) => _togglePlatformFilter(key, name),
+            onChanged: null, // 禁用功能，只保留 UI
             activeColor: color,
           ),
-          onTap: _isLoading
-              ? null
-              : () => _togglePlatformFilter(key, name),
+          onTap: null, // 禁用功能，只保留 UI
         ),
       );
     }).toList();
