@@ -654,6 +654,116 @@ class ClientsProvider extends ChangeNotifier {
     _autoBanCheckTimer = null;
   }
 
+  /// فعال‌سازی فیلترینگ شبکه‌های اجتماعی برای یک دستگاه
+  Future<Map<String, dynamic>> enableSocialMediaFilter(
+    String deviceIp, {
+    String? deviceMac,
+    String? deviceName,
+    List<String>? platforms,
+  }) async {
+    if (!_serviceManager.isConnected) {
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return {'success': false, 'error': _errorMessage};
+    }
+
+    try {
+      final result = await _serviceManager.service?.enableSocialMediaFilter(
+        deviceIp,
+        deviceMac: deviceMac,
+        deviceName: deviceName,
+        platforms: platforms,
+      );
+
+      if (result != null && result['success'] == true) {
+        await refresh();
+        return result;
+      } else {
+        _errorMessage = result?['errors']?.join(', ') ?? 'خطا در فعال‌سازی فیلتر';
+        notifyListeners();
+        return result ?? {'success': false, 'error': 'خطای نامشخص'};
+      }
+    } catch (e) {
+      _errorMessage = 'خطا در فعال‌سازی فیلتر شبکه‌های اجتماعی: $e';
+      notifyListeners();
+      return {'success': false, 'error': _errorMessage};
+    }
+  }
+
+  /// غیرفعال‌سازی فیلترینگ شبکه‌های اجتماعی برای یک دستگاه
+  Future<bool> disableSocialMediaFilter(String deviceIp) async {
+    if (!_serviceManager.isConnected) {
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return false;
+    }
+
+    try {
+      final success = await _serviceManager.service?.disableSocialMediaFilter(deviceIp);
+      if (success == true) {
+        await refresh();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      _errorMessage = 'خطا در غیرفعال‌سازی فیلتر: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// بررسی وضعیت فیلترینگ شبکه‌های اجتماعی برای یک دستگاه
+  Future<Map<String, dynamic>> getSocialMediaFilterStatus(String deviceIp) async {
+    if (!_serviceManager.isConnected) {
+      return {'is_active': false, 'error': 'اتصال برقرار نشده است.'};
+    }
+
+    try {
+      final status = await _serviceManager.service?.getSocialMediaFilterStatus(deviceIp);
+      return status ?? {'is_active': false, 'platforms': {}};
+    } catch (e) {
+      return {'is_active': false, 'error': e.toString(), 'platforms': {}};
+    }
+  }
+
+  /// فیلتر/رفع فیلتر یک پلتفرم خاص برای یک دستگاه
+  Future<Map<String, dynamic>> togglePlatformFilter(
+    String deviceIp,
+    String platform, {
+    String? deviceMac,
+    String? deviceName,
+    bool enable = true,
+  }) async {
+    if (!_serviceManager.isConnected) {
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return {'success': false, 'error': _errorMessage};
+    }
+
+    try {
+      final result = await _serviceManager.service?.togglePlatformFilter(
+        deviceIp,
+        platform,
+        deviceMac: deviceMac,
+        deviceName: deviceName,
+        enable: enable,
+      );
+
+      if (result != null && result['success'] == true) {
+        await refresh();
+        return result;
+      } else {
+        _errorMessage = result?['error']?.toString() ?? 'خطا در تغییر وضعیت فیلتر';
+        notifyListeners();
+        return result ?? {'success': false, 'error': 'خطای نامشخص'};
+      }
+    } catch (e) {
+      _errorMessage = 'خطا در تغییر وضعیت فیلتر: $e';
+      notifyListeners();
+      return {'success': false, 'error': _errorMessage};
+    }
+  }
+
   @override
   void dispose() {
     _cancelAutoBanTimer();

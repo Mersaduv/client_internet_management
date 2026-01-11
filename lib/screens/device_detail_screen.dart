@@ -26,6 +26,12 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
   bool _isLoading = false;
   String? _speedLimit;
   bool? _isStatic;
+  bool? _isSocialMediaFiltered;
+  Map<String, bool> _platformFilterStatus = {
+    'telegram': false,
+    'facebook': false,
+  };
+  bool _isLoadingStatus = false; // برای جلوگیری از race condition
 
   static const Color _primaryColor = Color(0xFF428B7C);
 
@@ -34,9 +40,185 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
     super.initState();
     // بارگذاری اطلاعات به صورت غیرهمزمان و بدون blocking کردن UI
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _loadSpeedLimit();
-      _checkStaticStatus();
+      _loadAllData();
     });
+  }
+
+  /// بارگذاری همه داده‌ها به صورت همزمان و صبر برای تمام شدن
+  Future<void> _loadAllData() async {
+    if (_isLoadingStatus) return; // جلوگیری از race condition
+    _isLoadingStatus = true;
+
+    try {
+      // بارگذاری همه داده‌ها به صورت همزمان
+      await Future.wait([
+        _loadSpeedLimit(),
+        _checkStaticStatus(),
+        _checkSocialMediaFilterStatus(),
+      ]);
+    } catch (e) {
+      print('[DEBUG] Error loading data: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoadingStatus = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _checkSocialMediaFilterStatus() async {
+    if (widget.device.ipAddress == null || widget.isBanned) {
+      print('[DEBUG] _checkSocialMediaFilterStatus: Skipping - IP: ${widget.device.ipAddress}, isBanned: ${widget.isBanned}');
+      return;
+    }
+
+    print('[DEBUG] _checkSocialMediaFilterStatus: Starting for device ${widget.device.ipAddress}');
+    try {
+      final provider = Provider.of<ClientsProvider>(context, listen: false);
+      final status = await provider.getSocialMediaFilterStatus(widget.device.ipAddress!);
+      print('[DEBUG] _checkSocialMediaFilterStatus: Received status: $status');
+      if (mounted) {
+        setState(() {
+          _isSocialMediaFiltered = status['is_active'] == true;
+          final platforms = status['platforms'] as Map<String, dynamic>?;
+          print('[DEBUG] _checkSocialMediaFilterStatus: is_active: ${status['is_active']}, platforms: $platforms');
+          if (platforms != null) {
+            // به‌روزرسانی فقط اگر داده معتبر است
+            _platformFilterStatus = {
+              'telegram': platforms['telegram'] == true,
+              'facebook': platforms['facebook'] == true,
+            };
+            print('[DEBUG] _checkSocialMediaFilterStatus: Updated _platformFilterStatus: $_platformFilterStatus');
+          } else {
+            print('[DEBUG] _checkSocialMediaFilterStatus: platforms is null');
+            // اگر platforms null است، همه را false کن
+            _platformFilterStatus = {
+              'telegram': false,
+              'facebook': false,
+            };
+          }
+        });
+      } else {
+        print('[DEBUG] _checkSocialMediaFilterStatus: Widget not mounted, skipping setState');
+      }
+    } catch (e) {
+      print('[DEBUG] _checkSocialMediaFilterStatus: Error: $e');
+      // در صورت خطا، وضعیت را null نگه دار (ناشناخته)
+      if (mounted) {
+        setState(() {
+          _isSocialMediaFiltered = null;
+          // در صورت خطا، همه را false کن
+          _platformFilterStatus = {
+            'telegram': false,
+            'facebook': false,
+          };
+        });
+      }
+    }
+  }
+
+  Future<void> _togglePlatformFilter(String platform, String platformName) async {
+    if (widget.device.ipAddress == null || widget.isBanned || _isLoading) return;
+
+    final isCurrentlyFiltered = _platformFilterStatus[platform] == true;
+    final actionText = isCurrentlyFiltered ? 'رفع فیلتر' : 'فیلتر کردن';
+    final message = isCurrentlyFiltered
+        ? 'آیا مطمئن هستید که می‌خواهید فیلتر $platformName را برای دستگاه ${widget.device.ipAddress} بردارید؟'
+        : 'آیا مطمئن هستید که می‌خواهید $platformName را برای دستگاه ${widget.device.ipAddress} فیلتر کنید؟';
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(actionText),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('لغو'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isCurrentlyFiltered ? Colors.green : Colors.orange,
+              foregroundColor: Colors.white,
+            ),
+            child: Text(actionText),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      setState(() {
+        _isLoading = true;
+      });
+
+      try {
+        final provider = Provider.of<ClientsProvider>(context, listen: false);
+        final result = await provider.togglePlatformFilter(
+          widget.device.ipAddress!,
+          platform,
+          deviceMac: widget.device.macAddress,
+          deviceName: widget.device.hostName ?? widget.device.name,
+          enable: !isCurrentlyFiltered,
+        );
+
+        if (mounted) {
+          if (result['success'] == true) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  isCurrentlyFiltered
+                      ? 'فیلتر $platformName با موفقیت برداشته شد'
+                      : 'فیلتر $platformName با موفقیت فعال شد',
+                ),
+                backgroundColor: Colors.green,
+              ),
+            );
+            // به‌روزرسانی فوری وضعیت UI قبل از بررسی مجدد
+            setState(() {
+              _platformFilterStatus[platform] = !isCurrentlyFiltered;
+            });
+            // بررسی مجدد وضعیت از سرور با تاخیر کوتاه (برای اطمینان از به‌روزرسانی سرور)
+            // چند بار بررسی کن تا مطمئن شویم که وضعیت درست است
+            Future.delayed(const Duration(milliseconds: 500), () {
+              if (mounted) {
+                _checkSocialMediaFilterStatus();
+              }
+            });
+            Future.delayed(const Duration(milliseconds: 1500), () {
+              if (mounted) {
+                _checkSocialMediaFilterStatus();
+              }
+            });
+            await _checkSocialMediaFilterStatus();
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('خطا: ${result['error'] ?? "خطا در تغییر وضعیت فیلتر"}'),
+                backgroundColor: Colors.red,
+              ),
+            );
+          }
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('خطا: $e'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+          });
+        }
+      }
+    }
   }
 
   Future<void> _checkStaticStatus() async {
@@ -1002,6 +1184,39 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                             ),
                           if (_speedLimit != null && _speedLimit != 'N/A')
                             _buildSpeedInfoRow(_speedLimit!),
+                          // نمایش وضعیت فیلتر شبکه‌های اجتماعی
+                          if (_isSocialMediaFiltered == true)
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              margin: const EdgeInsets.only(top: 8),
+                              decoration: BoxDecoration(
+                                color: Colors.orange.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: Colors.orange.withOpacity(0.3),
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(
+                                    Icons.filter_alt,
+                                    color: Colors.orange,
+                                    size: 20,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      'فیلتر Telegram فعال است',
+                                      style: const TextStyle(
+                                        color: Colors.orange,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                         ],
                       ],
                     ),
@@ -1109,13 +1324,97 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> {
                               ),
                             ),
                           ),
+                        const SizedBox(height: 12),
+                        // فیلتر شبکه‌های اجتماعی (انتخاب تکی هر پلتفرم)
+                        if (!widget.isBanned)
+                          Container(
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.grey.shade300),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.filter_alt,
+                                      color: _primaryColor,
+                                      size: 24,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    const Text(
+                                      'فیلتر Telegram',
+                                      style: TextStyle(
+                                        fontSize: 18,
+                                        fontWeight: FontWeight.bold,
+                                        color: _primaryColor,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 16),
+                                ..._buildPlatformFilterToggles(),
+                              ],
+                            ),
+                          ),
                       ],
                     ),
                   ),
+
                 ],
               ),
             ),
     );
+  }
+
+
+  List<Widget> _buildPlatformFilterToggles() {
+    final platforms = [
+      {'key': 'telegram', 'name': 'تلگرام', 'icon': Icons.telegram, 'color': Colors.blue},
+    ];
+
+    return platforms.map((platform) {
+      final key = platform['key'] as String;
+      final name = platform['name'] as String;
+      final icon = platform['icon'] as IconData;
+      final color = platform['color'] as Color;
+      final isFiltered = _platformFilterStatus[key] == true;
+
+      return Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        decoration: BoxDecoration(
+          color: isFiltered ? color.withOpacity(0.1) : Colors.grey.shade50,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isFiltered ? color : Colors.grey.shade300,
+            width: isFiltered ? 2 : 1,
+          ),
+        ),
+        child: ListTile(
+          leading: Icon(icon, color: isFiltered ? color : Colors.grey),
+          title: Text(
+            name,
+            style: TextStyle(
+              fontWeight: FontWeight.w600,
+              color: isFiltered ? color : Colors.black87,
+            ),
+          ),
+          trailing: Switch(
+            value: isFiltered,
+            onChanged: _isLoading
+                ? null
+                : (value) => _togglePlatformFilter(key, name),
+            activeColor: color,
+          ),
+          onTap: _isLoading
+              ? null
+              : () => _togglePlatformFilter(key, name),
+        ),
+      );
+    }).toList();
   }
 
   Widget _buildInfoRow(String label, String value) {
