@@ -1056,8 +1056,23 @@ class MikroTikService {
         // بررسی اینکه آیا این rule مربوط به فیلتر شبکه‌های اجتماعی است
         bool isSocialMediaFilter = false;
         
+        // بررسی Telegram Filtering (برای Telegram filtering مخصوص)
+        if (comment.contains('Telegram Filtering') || dstAddressList == 'Telegram') {
+          isSocialMediaFilter = true;
+        }
+        
+        // بررسی TikTok Filtering (برای TikTok filtering مخصوص)
+        if (comment.contains('TikTok Filtering') || dstAddressList == 'TikTok') {
+          isSocialMediaFilter = true;
+        }
+        
+        // بررسی YouTube Filtering (برای YouTube filtering مخصوص)
+        if (comment.contains('Youtube Filtering') || dstAddressList == 'YouTube') {
+          isSocialMediaFilter = true;
+        }
+        
         // بررسی comment
-        if (comment.isNotEmpty) {
+        if (!isSocialMediaFilter && comment.isNotEmpty) {
           final commentLower = comment.toLowerCase();
           if (commentLower.contains('block social') ||
               commentLower.contains('sm-filter') ||
@@ -1071,9 +1086,9 @@ class MikroTikService {
         }
         
         // بررسی dst-address-list (Address-List مربوط به شبکه‌های اجتماعی)
-        if (dstAddressList == 'Blocked-Social' || 
+        if (!isSocialMediaFilter && (dstAddressList == 'Blocked-Social' || 
             dstAddressList == 'Blocked-Social-IP' ||
-            dstAddressList.toLowerCase().contains('social')) {
+            dstAddressList.toLowerCase().contains('social'))) {
           isSocialMediaFilter = true;
         }
         
@@ -5793,16 +5808,14 @@ class MikroTikService {
       ],
       'telegram': [
         // Telegram IP ranges (AS62041) - رنج‌های پایه و پایدار
+        // IP ranges طبق توضیحات کاربر
         '149.154.160.0/20',  // Telegram DC - Main range
         '149.154.164.0/22',  // Telegram DC
-        '149.154.168.0/22',  // Telegram DC
-        '149.154.172.0/22',  // Telegram DC
         '91.108.4.0/22',     // Telegram DC
-        '91.108.8.0/22',     // Telegram DC
-        '91.108.12.0/22',    // Telegram DC
-        '91.108.16.0/22',    // Telegram DC
-        '91.108.20.0/22',    // Telegram DC
         '91.108.56.0/22',    // Telegram DC
+        '91.108.8.0/22',     // Telegram DC
+        '149.154.172.0/22',  // Telegram DC
+        '91.108.12.0/22',    // Telegram DC
       ],
       'whatsapp': [
         'whatsapp.com',
@@ -6421,9 +6434,39 @@ class MikroTikService {
           print('[DEBUG]   Comment: $comment');
           print('[DEBUG]   Dst Address List: ${rule['dst-address-list']?.toString() ?? 'N/A'}');
           
+          // بررسی Telegram Filtering (برای Telegram filtering مخصوص)
+          final dstAddressList = rule['dst-address-list']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final disabled = rule['disabled']?.toString().toLowerCase() == 'true';
+          
+          if (dstAddressList == 'Telegram' && 
+              comment.contains('Telegram Filtering') && 
+              action == 'drop' && 
+              chain == 'prerouting' &&
+              !disabled) {
+            print('[DEBUG]   Found Telegram Filtering rule');
+            platformStatus['telegram'] = true;
+            hasRawRule = true;
+            rawRuleIds.add(ruleId);
+            continue; // ادامه به rule بعدی
+          }
+          
+          // بررسی YouTube Filtering (برای YouTube filtering مخصوص)
+          if (dstAddressList == 'YouTube' && 
+              comment.contains('Youtube Filtering') && 
+              action == 'drop' && 
+              chain == 'prerouting' &&
+              !disabled) {
+            print('[DEBUG]   Found YouTube Filtering rule');
+            platformStatus['youtube'] = true;
+            hasRawRule = true;
+            rawRuleIds.add(ruleId);
+            continue; // ادامه به rule بعدی
+          }
+          
           // بررسی Raw Rules با comment "Block social" یا "SM-Filter"
           // یا Raw Rules که به Blocked-Social اشاره می‌کنند (حتی اگر comment خالی باشد)
-          final dstAddressList = rule['dst-address-list']?.toString() ?? '';
           final hasBlockedSocialAddressList = dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP';
           
           if (comment.contains('Block social') || comment.contains('SM-Filter') || hasBlockedSocialAddressList) {
@@ -6482,6 +6525,12 @@ class MikroTikService {
                   foundViaTag = true;
                 }
               }
+            }
+            
+            // بررسی Telegram Filtering comment (برای Telegram filtering مخصوص)
+            if (comment.contains('Telegram Filtering')) {
+              platformStatus['telegram'] = true;
+              foundViaTag = true;
             }
             
             // سوم: بررسی کلمات کلیدی در comment (fallback) - اولویت سوم
@@ -6641,11 +6690,54 @@ class MikroTikService {
             }
           }
           
+          // بررسی Telegram Address List (برای Telegram filtering مخصوص)
+          if (dstAddressList == 'Telegram' && srcAddress == deviceIp) {
+            platformStatus['telegram'] = true;
+          }
+          
+          // بررسی YouTube Address List (برای YouTube filtering مخصوص)
+          if (dstAddressList == 'YouTube' && srcAddress == deviceIp) {
+            platformStatus['youtube'] = true;
+          }
+          
+          // بررسی YouTube TLS Host Detection Rules (action=add-dst-to-address-list)
+          // این rules برای YouTube filtering مخصوص استفاده می‌شوند
+          final action = rule['action']?.toString() ?? '';
+          final addressList = rule['dst-address-list']?.toString() ?? '';
+          if (action == 'add-dst-to-address-list' && 
+              addressList == 'YouTube' && 
+              tlsHost.isNotEmpty &&
+              (comment.contains('Youtube') || tlsHost.toLowerCase().contains('youtube') || tlsHost.toLowerCase().contains('ytimg') || tlsHost.toLowerCase().contains('googlevideo') || tlsHost.toLowerCase().contains('ggpht'))) {
+            // بررسی اینکه آیا RAW rule برای این device وجود دارد که به YouTube اشاره می‌کند
+            bool hasYouTubeRawRule = false;
+            for (final rawRule in allRawRules) {
+              final rawSrcAddr = rawRule['src-address']?.toString() ?? '';
+              final rawDstList = rawRule['dst-address-list']?.toString() ?? '';
+              final rawComment = rawRule['comment']?.toString() ?? '';
+              if (rawSrcAddr == deviceIp && 
+                  rawDstList == 'YouTube' &&
+                  rawComment.contains('Youtube Filtering')) {
+                hasYouTubeRawRule = true;
+                break;
+              }
+            }
+            
+            if (hasYouTubeRawRule) {
+              platformStatus['youtube'] = true;
+              print('[DEBUG]   Found YouTube TLS Host Detection rule (global) and RAW rule for device: tls-host=$tlsHost');
+            }
+          }
+          
           // بررسی TLS-SNI rules (حتی اگر comment نداشته باشد)
           if (tlsHost.isNotEmpty) {
             final tlsHostLower = tlsHost.toLowerCase();
             if (tlsHostLower.contains('telegram.org') || tlsHostLower.contains('t.me') || tlsHostLower.contains('telegram.me')) {
               platformStatus['telegram'] = true;
+            }
+            // بررسی YouTube domains در TLS host
+            if (tlsHostLower.contains('youtube') || tlsHostLower.contains('ytimg') || tlsHostLower.contains('googlevideo') || tlsHostLower.contains('ggpht')) {
+              platformStatus['youtube'] = true;
+              print('[DEBUG]   Found YouTube domain in TLS host: $tlsHost');
             }
           }
           
@@ -6972,31 +7064,75 @@ class MikroTikService {
 
     try {
       if (enable) {
-        // قبل از فعال‌سازی: پاکسازی rules قدیمی این پلتفرم
-        final cleanedCount = await _cleanupOldPlatformRules(deviceIp, platformLower);
-        
-        // فعال‌سازی فیلتر برای این پلتفرم
-        final result = await enableSocialMediaFilter(
-          deviceIp,
-          deviceMac: deviceMac,
-          deviceName: deviceName,
-          platforms: [platformLower],
-        );
-        return {
-          'success': result['success'] == true,
-          'platform': platformLower,
-          'action': 'enabled',
-          'old_rules_cleaned': cleanedCount,
-          'result': result,
-        };
+        // برای Telegram: استفاده از روش خاص (Address List + Mangle + RAW)
+        if (platformLower == 'telegram') {
+          final result = await enableTelegramFilter(
+            deviceIp,
+            deviceMac: deviceMac,
+            deviceName: deviceName,
+          );
+          return {
+            'success': result['success'] == true,
+            'platform': platformLower,
+            'action': 'enabled',
+            'result': result,
+          };
+        } else if (platformLower == 'youtube') {
+          // برای YouTube: استفاده از روش خاص (Mangle + TLS Host Detection + RAW)
+          final result = await enableYouTubeFilter(
+            deviceIp,
+            deviceMac: deviceMac,
+            deviceName: deviceName,
+          );
+          return {
+            'success': result['success'] == true,
+            'platform': platformLower,
+            'action': 'enabled',
+            'result': result,
+          };
+        } else {
+          // برای سایر پلتفرم‌ها: استفاده از روش معمول
+          final cleanedCount = await _cleanupOldPlatformRules(deviceIp, platformLower);
+          
+          // فعال‌سازی فیلتر برای این پلتفرم
+          final result = await enableSocialMediaFilter(
+            deviceIp,
+            deviceMac: deviceMac,
+            deviceName: deviceName,
+            platforms: [platformLower],
+          );
+          return {
+            'success': result['success'] == true,
+            'platform': platformLower,
+            'action': 'enabled',
+            'old_rules_cleaned': cleanedCount,
+            'result': result,
+          };
+        }
       } else {
         // غیرفعال‌سازی فیلتر برای این پلتفرم
-        final success = await disablePlatformFilter(deviceIp, platformLower);
-        return {
-          'success': success,
-          'platform': platformLower,
-          'action': 'disabled',
-        };
+        if (platformLower == 'telegram') {
+          final success = await disableTelegramFilter(deviceIp);
+          return {
+            'success': success,
+            'platform': platformLower,
+            'action': 'disabled',
+          };
+        } else if (platformLower == 'youtube') {
+          final success = await disableYouTubeFilter(deviceIp);
+          return {
+            'success': success,
+            'platform': platformLower,
+            'action': 'disabled',
+          };
+        } else {
+          final success = await disablePlatformFilter(deviceIp, platformLower);
+          return {
+            'success': success,
+            'platform': platformLower,
+            'action': 'disabled',
+          };
+        }
       }
     } catch (e) {
       return {
@@ -7004,6 +7140,452 @@ class MikroTikService {
         'platform': platformLower,
         'error': e.toString(),
       };
+    }
+  }
+
+  /// فعال‌سازی فیلترینگ Telegram با استفاده از Address List + Mangle + RAW
+  /// طبق توضیحات کاربر: Address List + Mangle (mark-routing) + RAW (drop)
+  Future<Map<String, dynamic>> enableTelegramFilter(
+    String deviceIp, {
+    String? deviceMac,
+    String? deviceName,
+  }) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (deviceIp.isEmpty) {
+      throw Exception('آدرس IP دستگاه الزامی است');
+    }
+
+    try {
+      final results = <String, dynamic>{};
+      final errors = <String>[];
+
+      // 1. ایجاد Address List "Telegram" با IP ranges ثابت
+      const addressListName = 'Telegram';
+      final telegramIPRanges = [
+        '149.154.160.0/20',
+        '149.154.164.0/22',
+        '91.108.4.0/22',
+        '91.108.56.0/22',
+        '91.108.8.0/22',
+        '149.154.172.0/22',
+        '91.108.12.0/22',
+      ];
+
+      int addressListCount = 0;
+      try {
+        // دریافت لیست موجود برای جلوگیری از duplicate
+        final allAddressList = await _client!.talk(['/ip/firewall/address-list/print']);
+        final existingAddresses = <String>{};
+        for (final entry in allAddressList) {
+          final list = entry['list']?.toString() ?? '';
+          final address = entry['address']?.toString() ?? '';
+          if (list == addressListName) {
+            existingAddresses.add(address);
+          }
+        }
+
+        // اضافه کردن IP ranges
+        for (final ipRange in telegramIPRanges) {
+          if (!existingAddresses.contains(ipRange)) {
+            try {
+              await _client!.talk([
+                '/ip/firewall/address-list/add',
+                '=list=$addressListName',
+                '=address=$ipRange',
+                '=comment=Telegram',
+              ]);
+              existingAddresses.add(ipRange);
+              addressListCount++;
+            } catch (e) {
+              // اگر duplicate است یا خطای دیگر، ادامه بده
+              print('[Telegram Filter] خطا در اضافه کردن $ipRange: $e');
+            }
+          }
+        }
+        results['address_list_entries'] = addressListCount;
+      } catch (e) {
+        errors.add('خطا در ایجاد Address List: $e');
+      }
+
+      // 2. ایجاد Mangle Rule (mark-routing) - برای Policy Routing
+      try {
+        // بررسی اینکه آیا Mangle rule از قبل وجود دارد
+        final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
+        bool mangleRuleExists = false;
+        for (final rule in allMangleRules) {
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          if (dstList == addressListName && 
+              action == 'mark-routing' && 
+              comment.contains('Telegram')) {
+            mangleRuleExists = true;
+            break;
+          }
+        }
+
+        if (!mangleRuleExists) {
+          await _client!.talk([
+            '/ip/firewall/mangle/add',
+            '=chain=prerouting',
+            '=dst-address-list=$addressListName',
+            '=action=mark-routing',
+            '=new-routing-mark=VPN',
+            '=passthrough=no',
+            '=comment=Telegram',
+          ]);
+          results['mangle_rule'] = 'created';
+        } else {
+          results['mangle_rule'] = 'already_exists';
+        }
+      } catch (e) {
+        errors.add('خطا در ایجاد Mangle Rule: $e');
+      }
+
+      // 3. ایجاد RAW Rule (drop) - برای فیلترینگ دستگاه خاص
+      try {
+        // بررسی اینکه آیا RAW rule از قبل وجود دارد
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        bool rawRuleExists = false;
+        String? existingRuleId;
+        for (final rule in allRawRules) {
+          final srcAddr = rule['src-address']?.toString() ?? '';
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          if (srcAddr == deviceIp && 
+              dstList == addressListName &&
+              action == 'drop' &&
+              chain == 'prerouting' &&
+              comment.contains('Telegram Filtering')) {
+            rawRuleExists = true;
+            existingRuleId = rule['.id']?.toString();
+            // اگر rule disabled است، آن را enable کنیم
+            if (rule['disabled'] == true) {
+              if (existingRuleId != null) {
+                await _client!.talk([
+                  '/ip/firewall/raw/set',
+                  '=.id=$existingRuleId',
+                  '=disabled=no',
+                ]);
+              }
+            }
+            break;
+          }
+        }
+
+        if (!rawRuleExists) {
+          final rawRuleParams = <String, String>{
+            'chain': 'prerouting',
+            'src-address': deviceIp,
+            'dst-address-list': addressListName,
+            'action': 'drop',
+            'comment': 'Telegram Filtering',
+            'disabled': 'no', // فعال (برخلاف توضیحات کاربر که disabled=yes بود)
+          };
+
+          if (deviceMac != null && deviceMac.isNotEmpty) {
+            rawRuleParams['src-mac-address'] = deviceMac;
+          }
+
+          final rawCommand = <String>['/ip/firewall/raw/add'];
+          rawRuleParams.forEach((key, value) {
+            rawCommand.add('=$key=$value');
+          });
+
+          await _client!.talk(rawCommand);
+          results['raw_rule'] = 'created';
+        } else {
+          results['raw_rule'] = 'already_exists';
+        }
+      } catch (e) {
+        errors.add('خطا در ایجاد RAW Rule: $e');
+      }
+
+      return {
+        'success': errors.isEmpty,
+        'device_ip': deviceIp,
+        'address_list_name': addressListName,
+        'address_list_entries': addressListCount,
+        'errors': errors,
+        'results': results,
+      };
+    } catch (e) {
+      throw Exception('خطا در فعال‌سازی فیلترینگ Telegram: $e');
+    }
+  }
+
+  /// غیرفعال‌سازی فیلترینگ Telegram برای یک دستگاه
+  Future<bool> disableTelegramFilter(String deviceIp) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (deviceIp.isEmpty) {
+      throw Exception('آدرس IP دستگاه الزامی است');
+    }
+
+    try {
+      const addressListName = 'Telegram';
+      int removedCount = 0;
+
+      // حذف RAW Rule مربوط به این دستگاه
+      try {
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (final rule in allRawRules) {
+          final srcAddr = rule['src-address']?.toString() ?? '';
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          if (srcAddr == deviceIp && 
+              dstList == addressListName &&
+              comment.contains('Telegram Filtering')) {
+            final ruleId = rule['.id']?.toString();
+            if (ruleId != null) {
+              await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
+              removedCount++;
+            }
+          }
+        }
+      } catch (e) {
+        print('[Telegram Filter] خطا در حذف RAW Rule: $e');
+      }
+
+      // توجه: Mangle Rule و Address List را حذف نمی‌کنیم چون ممکن است سایر دستگاه‌ها از آن استفاده کنند
+      // فقط RAW Rule device-specific را حذف می‌کنیم
+
+      return removedCount > 0;
+    } catch (e) {
+      throw Exception('خطا در غیرفعال‌سازی فیلترینگ Telegram: $e');
+    }
+  }
+
+  /// فعال‌سازی فیلترینگ YouTube با استفاده از Mangle + TLS Host Detection + RAW
+  /// طبق توضیحات کاربر: Mangle (mark-routing) + TLS Host Detection (add-dst-to-address-list) + RAW (drop)
+  Future<Map<String, dynamic>> enableYouTubeFilter(
+    String deviceIp, {
+    String? deviceMac,
+    String? deviceName,
+  }) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (deviceIp.isEmpty) {
+      throw Exception('آدرس IP دستگاه الزامی است');
+    }
+
+    try {
+      final results = <String, dynamic>{};
+      final errors = <String>[];
+
+      // 1. ایجاد Mangle Rule (mark-routing) - برای Policy Routing
+      const addressListName = 'YouTube';
+      try {
+        // بررسی اینکه آیا Mangle rule از قبل وجود دارد
+        final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
+        bool mangleRuleExists = false;
+        for (final rule in allMangleRules) {
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          if (dstList == addressListName && 
+              action == 'mark-routing' && 
+              comment.contains('Youtube')) {
+            mangleRuleExists = true;
+            break;
+          }
+        }
+
+        if (!mangleRuleExists) {
+          await _client!.talk([
+            '/ip/firewall/mangle/add',
+            '=chain=prerouting',
+            '=dst-address-list=$addressListName',
+            '=action=mark-routing',
+            '=new-routing-mark=VPN',
+            '=passthrough=no',
+            '=comment=Youtube',
+          ]);
+          results['mangle_rule'] = 'created';
+        } else {
+          results['mangle_rule'] = 'already_exists';
+        }
+      } catch (e) {
+        errors.add('خطا در ایجاد Mangle Rule: $e');
+      }
+
+      // 2. ایجاد TLS Host Detection Rules (add-dst-to-address-list)
+      // طبق توضیحات کاربر: استفاده از action=add-dst-to-address-list برای تشخیص و افزودن IP
+      final youtubeDomains = [
+        '*youtube*',
+        '*ytimg*',
+        '*googlevideo*',
+        '*ggpht*',
+      ];
+
+      int tlsHostRulesCount = 0;
+      try {
+        final allFilterRules = await _client!.talk(['/ip/firewall/filter/print']);
+        for (final domain in youtubeDomains) {
+          // بررسی اینکه آیا rule از قبل وجود دارد
+          bool ruleExists = false;
+          for (final rule in allFilterRules) {
+            final tlsHost = rule['tls-host']?.toString() ?? '';
+            final comment = rule['comment']?.toString() ?? '';
+            final action = rule['action']?.toString() ?? '';
+            final addressList = rule['dst-address-list']?.toString() ?? '';
+            if (tlsHost == domain &&
+                action == 'add-dst-to-address-list' &&
+                addressList == addressListName &&
+                comment.contains('Youtube')) {
+              ruleExists = true;
+              break;
+            }
+          }
+
+          if (!ruleExists) {
+            try {
+              await _client!.talk([
+                '/ip/firewall/filter/add',
+                '=chain=forward',
+                '=protocol=tcp',
+                '=dst-port=443',
+                '=tls-host=$domain',
+                '=action=add-dst-to-address-list',
+                '=address-list=$addressListName',
+                '=address-list-timeout=1d',
+                '=comment=Youtube',
+              ]);
+              tlsHostRulesCount++;
+            } catch (e) {
+              print('[YouTube Filter] خطا در ایجاد TLS Host Detection rule برای $domain: $e');
+            }
+          }
+        }
+        results['tls_host_detection_rules'] = tlsHostRulesCount;
+      } catch (e) {
+        errors.add('خطا در ایجاد TLS Host Detection Rules: $e');
+      }
+
+      // 3. ایجاد RAW Rule (drop) - برای فیلترینگ دستگاه خاص
+      try {
+        // بررسی اینکه آیا RAW rule از قبل وجود دارد
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        bool rawRuleExists = false;
+        String? existingRuleId;
+        for (final rule in allRawRules) {
+          final srcAddr = rule['src-address']?.toString() ?? '';
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          if (srcAddr == deviceIp && 
+              dstList == addressListName &&
+              action == 'drop' &&
+              chain == 'prerouting' &&
+              comment.contains('Youtube Filtering')) {
+            rawRuleExists = true;
+            existingRuleId = rule['.id']?.toString();
+            // اگر rule disabled است، آن را enable کنیم
+            if (rule['disabled'] == true) {
+              if (existingRuleId != null) {
+                await _client!.talk([
+                  '/ip/firewall/raw/set',
+                  '=.id=$existingRuleId',
+                  '=disabled=no',
+                ]);
+              }
+            }
+            break;
+          }
+        }
+
+        if (!rawRuleExists) {
+          final rawRuleParams = <String, String>{
+            'chain': 'prerouting',
+            'src-address': deviceIp,
+            'dst-address-list': addressListName,
+            'action': 'drop',
+            'comment': 'Youtube Filtering',
+            'disabled': 'no', // فعال (برخلاف توضیحات کاربر که disabled=yes بود)
+          };
+
+          if (deviceMac != null && deviceMac.isNotEmpty) {
+            rawRuleParams['src-mac-address'] = deviceMac;
+          }
+
+          final rawCommand = <String>['/ip/firewall/raw/add'];
+          rawRuleParams.forEach((key, value) {
+            rawCommand.add('=$key=$value');
+          });
+
+          await _client!.talk(rawCommand);
+          results['raw_rule'] = 'created';
+        } else {
+          results['raw_rule'] = 'already_exists';
+        }
+      } catch (e) {
+        errors.add('خطا در ایجاد RAW Rule: $e');
+      }
+
+      return {
+        'success': errors.isEmpty,
+        'device_ip': deviceIp,
+        'address_list_name': addressListName,
+        'tls_host_detection_rules': tlsHostRulesCount,
+        'errors': errors,
+        'results': results,
+      };
+    } catch (e) {
+      throw Exception('خطا در فعال‌سازی فیلترینگ YouTube: $e');
+    }
+  }
+
+  /// غیرفعال‌سازی فیلترینگ YouTube برای یک دستگاه
+  Future<bool> disableYouTubeFilter(String deviceIp) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (deviceIp.isEmpty) {
+      throw Exception('آدرس IP دستگاه الزامی است');
+    }
+
+    try {
+      const addressListName = 'YouTube';
+      int removedCount = 0;
+
+      // حذف RAW Rule مربوط به این دستگاه
+      try {
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (final rule in allRawRules) {
+          final srcAddr = rule['src-address']?.toString() ?? '';
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          if (srcAddr == deviceIp && 
+              dstList == addressListName &&
+              comment.contains('Youtube Filtering')) {
+            final ruleId = rule['.id']?.toString();
+            if (ruleId != null) {
+              await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
+              removedCount++;
+            }
+          }
+        }
+      } catch (e) {
+        print('[YouTube Filter] خطا در حذف RAW Rule: $e');
+      }
+
+      // توجه: Mangle Rule و TLS Host Detection Rules را حذف نمی‌کنیم چون ممکن است سایر دستگاه‌ها از آن استفاده کنند
+      // فقط RAW Rule device-specific را حذف می‌کنیم
+
+      return removedCount > 0;
+    } catch (e) {
+      throw Exception('خطا در غیرفعال‌سازی فیلترینگ YouTube: $e');
     }
   }
 

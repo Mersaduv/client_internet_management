@@ -19,6 +19,8 @@ class ClientsProvider extends ChangeNotifier {
   bool _isNewConnectionsLocked = false;
   // Map برای ذخیره وضعیت Static دستگاه‌ها (key: IP یا MAC, value: bool)
   final Map<String, bool> _deviceStaticStatus = {};
+  // Map برای ذخیره وضعیت فیلترینگ شبکه‌های اجتماعی (key: deviceIp, value: Map<String, bool>)
+  final Map<String, Map<String, bool>> _deviceFilterStatus = {};
 
   // Timer برای بررسی دوره‌ای دستگاه‌های جدید (real-time auto-ban)
   Timer? _autoBanCheckTimer;
@@ -487,6 +489,7 @@ class ClientsProvider extends ChangeNotifier {
     _routerInfo = null;
     _isNewConnectionsLocked = false;
     _deviceStaticStatus.clear(); // پاک کردن cache وضعیت Static
+    _deviceFilterStatus.clear(); // پاک کردن cache وضعیت فیلترینگ
     notifyListeners();
   }
 
@@ -655,16 +658,101 @@ class ClientsProvider extends ChangeNotifier {
   }
 
   /// بررسی وضعیت فیلترینگ شبکه‌های اجتماعی برای یک دستگاه
-  Future<Map<String, dynamic>> getSocialMediaFilterStatus(String deviceIp) async {
+  /// با استفاده از cache برای بهبود عملکرد و حفظ حالت
+  Future<Map<String, dynamic>> getSocialMediaFilterStatus(String deviceIp, {bool forceRefresh = false}) async {
     if (!_serviceManager.isConnected) {
+      // اگر cache موجود است، از آن استفاده کن
+      if (_deviceFilterStatus.containsKey(deviceIp)) {
+        final cached = _deviceFilterStatus[deviceIp]!;
+        return {
+          'is_active': cached.values.any((v) => v == true),
+          'platforms': Map<String, dynamic>.from(cached),
+        };
+      }
       return {'is_active': false, 'error': 'اتصال برقرار نشده است.'};
+    }
+
+    // اگر forceRefresh نیست و cache موجود است، از cache استفاده کن
+    if (!forceRefresh && _deviceFilterStatus.containsKey(deviceIp)) {
+      final cached = _deviceFilterStatus[deviceIp]!;
+      print('[Filter Status] استفاده از cache برای $deviceIp: $cached');
+      // در پس‌زمینه به‌روزرسانی کن (بدون blocking کردن UI)
+      _refreshFilterStatusInBackground(deviceIp);
+      return {
+        'is_active': cached.values.any((v) => v == true),
+        'platforms': Map<String, dynamic>.from(cached),
+      };
     }
 
     try {
       final status = await _serviceManager.service?.getSocialMediaFilterStatus(deviceIp);
+      final platforms = status?['platforms'] as Map<String, dynamic>? ?? {};
+      
+      // به‌روزرسانی cache
+      final platformStatus = <String, bool>{
+        'telegram': platforms['telegram'] == true,
+        'facebook': platforms['facebook'] == true,
+        'instagram': platforms['instagram'] == true,
+        'tiktok': platforms['tiktok'] == true,
+        'whatsapp': platforms['whatsapp'] == true,
+        'youtube': platforms['youtube'] == true,
+      };
+      _deviceFilterStatus[deviceIp] = platformStatus;
+      print('[Filter Status] به‌روزرسانی cache برای $deviceIp: $platformStatus');
+      
       return status ?? {'is_active': false, 'platforms': {}};
     } catch (e) {
+      // در صورت خطا، اگر cache موجود است، از آن استفاده کن
+      if (_deviceFilterStatus.containsKey(deviceIp)) {
+        final cached = _deviceFilterStatus[deviceIp]!;
+        print('[Filter Status] خطا در دریافت وضعیت، استفاده از cache: $e');
+        return {
+          'is_active': cached.values.any((v) => v == true),
+          'platforms': Map<String, dynamic>.from(cached),
+          'error': e.toString(),
+        };
+      }
       return {'is_active': false, 'error': e.toString(), 'platforms': {}};
+    }
+  }
+
+  /// به‌روزرسانی وضعیت فیلتر در پس‌زمینه
+  Future<void> _refreshFilterStatusInBackground(String deviceIp) async {
+    try {
+      final status = await _serviceManager.service?.getSocialMediaFilterStatus(deviceIp);
+      final platforms = status?['platforms'] as Map<String, dynamic>? ?? {};
+      
+      final platformStatus = <String, bool>{
+        'telegram': platforms['telegram'] == true,
+        'facebook': platforms['facebook'] == true,
+        'instagram': platforms['instagram'] == true,
+        'tiktok': platforms['tiktok'] == true,
+        'whatsapp': platforms['whatsapp'] == true,
+        'youtube': platforms['youtube'] == true,
+      };
+      
+      // بررسی تغییرات با مقایسه عمیق
+      final cached = _deviceFilterStatus[deviceIp];
+      bool hasChanges = false;
+      if (cached == null) {
+        hasChanges = true;
+      } else {
+        for (final key in platformStatus.keys) {
+          if (cached[key] != platformStatus[key]) {
+            hasChanges = true;
+            break;
+          }
+        }
+      }
+      
+      if (hasChanges) {
+        _deviceFilterStatus[deviceIp] = platformStatus;
+        print('[Filter Status] پس‌زمینه به‌روزرسانی cache برای $deviceIp: $platformStatus');
+        notifyListeners(); // اطلاع دادن به listeners که وضعیت تغییر کرده است
+      }
+    } catch (e) {
+      // ignore errors in background refresh
+      print('[Filter Status] خطا در به‌روزرسانی پس‌زمینه: $e');
     }
   }
 
@@ -692,7 +780,27 @@ class ClientsProvider extends ChangeNotifier {
       );
 
       if (result != null && result['success'] == true) {
+        // به‌روزرسانی cache فوری
+        if (!_deviceFilterStatus.containsKey(deviceIp)) {
+          _deviceFilterStatus[deviceIp] = {
+            'telegram': false,
+            'facebook': false,
+            'instagram': false,
+            'tiktok': false,
+            'whatsapp': false,
+            'youtube': false,
+          };
+        }
+        _deviceFilterStatus[deviceIp]![platform.toLowerCase()] = enable;
+        print('[Filter Status] به‌روزرسانی cache بعد از toggle برای $deviceIp: ${_deviceFilterStatus[deviceIp]}');
+        
+        // به‌روزرسانی کامل از سرور (برای اطمینان)
+        Future.delayed(const Duration(milliseconds: 500), () {
+          _refreshFilterStatusInBackground(deviceIp);
+        });
+        
         await refresh();
+        notifyListeners(); // اطلاع دادن به listeners
         return result;
       } else {
         _errorMessage = result?['error']?.toString() ?? 'خطا در تغییر وضعیت فیلتر';
