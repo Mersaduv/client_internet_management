@@ -1071,6 +1071,20 @@ class MikroTikService {
           isSocialMediaFilter = true;
         }
         
+        // بررسی Instagram Filtering (برای Instagram filtering مخصوص)
+        if (comment.contains('Instagram Filtering') || 
+            comment.contains('Block Instagram Traffic') ||
+            dstAddressList == 'Instagram') {
+          isSocialMediaFilter = true;
+        }
+        
+        // بررسی Facebook Filtering (برای Facebook filtering مخصوص)
+        if (comment.contains('Facebook Filtering') || 
+            comment.contains('Block Facebook Traffic') ||
+            dstAddressList == 'FaceBook') {
+          isSocialMediaFilter = true;
+        }
+        
         // بررسی comment
         if (!isSocialMediaFilter && comment.isNotEmpty) {
           final commentLower = comment.toLowerCase();
@@ -6400,39 +6414,23 @@ class MikroTikService {
       bool hasRawRule = false;
       final List<String> rawRuleIds = [];
       
-      // لاگ: تعداد Raw Rules
-      print('[DEBUG] Total Raw Rules found: ${allRawRules.length}');
-      
       // بررسی وضعیت هر پلتفرم جداگانه
       final platformStatus = <String, bool>{
         'telegram': false,
         'facebook': false,
-        'instagram': false,
         'tiktok': false,
         'whatsapp': false,
         'youtube': false,
+        'instagram': false,
       };
 
       // بررسی Raw Rules
-      int rawRuleIndex = 0;
       for (final rule in allRawRules) {
-        rawRuleIndex++;
         final srcAddress = rule['src-address']?.toString() ?? '';
         final comment = rule['comment']?.toString() ?? '';
-        final dstAddressList = rule['dst-address-list']?.toString() ?? '';
         final ruleId = rule['.id']?.toString() ?? '';
         
-        // لاگ برای همه Raw Rules
-        if (dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP') {
-          print('[DEBUG] Raw Rule #$rawRuleIndex: src-address=$srcAddress, deviceIp=$deviceIp, match=${srcAddress == deviceIp}');
-        }
-        
         if (srcAddress == deviceIp) {
-          // لاگ: Raw Rule مربوط به این device
-          print('[DEBUG] Raw Rule #$rawRuleIndex for device $deviceIp:');
-          print('[DEBUG]   Rule ID: $ruleId');
-          print('[DEBUG]   Comment: $comment');
-          print('[DEBUG]   Dst Address List: ${rule['dst-address-list']?.toString() ?? 'N/A'}');
           
           // بررسی Telegram Filtering (برای Telegram filtering مخصوص)
           final dstAddressList = rule['dst-address-list']?.toString() ?? '';
@@ -6445,32 +6443,51 @@ class MikroTikService {
               action == 'drop' && 
               chain == 'prerouting' &&
               !disabled) {
-            print('[DEBUG]   Found Telegram Filtering rule');
             platformStatus['telegram'] = true;
             hasRawRule = true;
             rawRuleIds.add(ruleId);
-            continue; // ادامه به rule بعدی
+            continue;
           }
           
-          // بررسی YouTube Filtering (برای YouTube filtering مخصوص)
           if (dstAddressList == 'YouTube' && 
               comment.contains('Youtube Filtering') && 
               action == 'drop' && 
               chain == 'prerouting' &&
               !disabled) {
-            print('[DEBUG]   Found YouTube Filtering rule');
             platformStatus['youtube'] = true;
             hasRawRule = true;
             rawRuleIds.add(ruleId);
-            continue; // ادامه به rule بعدی
+            continue;
           }
+          
+          if (dstAddressList == 'Instagram' && 
+              (comment.contains('Instagram Filtering') || comment.contains('Block Instagram Traffic')) && 
+              action == 'drop' && 
+              chain == 'prerouting' &&
+              !disabled) {
+            platformStatus['instagram'] = true;
+            hasRawRule = true;
+            rawRuleIds.add(ruleId);
+            continue;
+          }
+          
+          if (dstAddressList == 'FaceBook' && 
+              (comment.contains('Facebook Filtering') || comment.contains('Block Facebook Traffic')) && 
+              action == 'drop' && 
+              chain == 'prerouting' &&
+              !disabled) {
+            platformStatus['facebook'] = true;
+            hasRawRule = true;
+            rawRuleIds.add(ruleId);
+            continue;
+          }
+          
           
           // بررسی Raw Rules با comment "Block social" یا "SM-Filter"
           // یا Raw Rules که به Blocked-Social اشاره می‌کنند (حتی اگر comment خالی باشد)
           final hasBlockedSocialAddressList = dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP';
           
           if (comment.contains('Block social') || comment.contains('SM-Filter') || hasBlockedSocialAddressList) {
-            print('[DEBUG]   This Raw Rule matches "Block social" or "SM-Filter"');
             hasRawRule = true;
             rawRuleIds.add(ruleId);
             
@@ -6538,17 +6555,16 @@ class MikroTikService {
             if (!foundViaTag) {
               if (commentLower.contains('telegram')) platformStatus['telegram'] = true;
               if (commentLower.contains('facebook') || commentLower.contains('fb.com') || commentLower.contains('fb ')) platformStatus['facebook'] = true;
-              if (commentLower.contains('instagram')) platformStatus['instagram'] = true;
               if (commentLower.contains('tiktok')) platformStatus['tiktok'] = true;
               if (commentLower.contains('whatsapp')) platformStatus['whatsapp'] = true;
               if (commentLower.contains('youtube') || commentLower.contains('googlevideo')) platformStatus['youtube'] = true;
+              if (commentLower.contains('instagram') || commentLower.contains('cdninstagram')) platformStatus['instagram'] = true;
             }
           }
           
           // بررسی Address-List در Raw Rules
           // مهم: این بررسی باید همیشه انجام شود، حتی اگر comment خالی باشد
           if (dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP') {
-            print('[DEBUG]   Raw Rule has dst-address-list: $dstAddressList');
             // همیشه hasRawRule را true کن (حتی اگر comment خالی باشد)
             if (!hasRawRule) {
               hasRawRule = true;
@@ -6561,7 +6577,6 @@ class MikroTikService {
             
             // اگر comment دارد، از آن استفاده کن
             if (comment.isNotEmpty) {
-              print('[DEBUG]   Comment for Address-List rule: $comment');
               final commentLower = comment.toLowerCase();
               
               bool foundViaTagInAddressList = false;
@@ -6573,7 +6588,6 @@ class MikroTikService {
                   final platformsStr = platformsMatch.group(1)?.trim() ?? '';
                   if (platformsStr.isNotEmpty) {
                     final platformsList = platformsStr.split(',').map((p) => p.trim().toLowerCase()).where((p) => p.isNotEmpty).toList();
-                    print('[DEBUG]   Found platforms from Raw Rule comment: $platformsList');
                     for (final p in platformsList) {
                       if (platformStatus.containsKey(p)) {
                         platformStatus[p] = true;
@@ -6594,7 +6608,6 @@ class MikroTikService {
                     platformStatus[platformName] = true;
                     foundViaTagInAddressList = true;
                     foundPlatformFromComment = true;
-                    print('[DEBUG]   Found platform from Raw Rule comment: $platformName');
                   }
                 }
               }
@@ -6604,41 +6617,32 @@ class MikroTikService {
                 if (commentLower.contains('telegram')) {
                   platformStatus['telegram'] = true;
                   foundPlatformFromComment = true;
-                  print('[DEBUG]   Found "telegram" keyword in comment');
                 }
                 if (commentLower.contains('facebook') || commentLower.contains('fb')) {
                   platformStatus['facebook'] = true;
                   foundPlatformFromComment = true;
-                  print('[DEBUG]   Found "facebook" keyword in comment');
-                }
-                if (commentLower.contains('instagram')) {
-                  platformStatus['instagram'] = true;
-                  foundPlatformFromComment = true;
-                  print('[DEBUG]   Found "instagram" keyword in comment');
                 }
                 if (commentLower.contains('tiktok')) {
                   platformStatus['tiktok'] = true;
                   foundPlatformFromComment = true;
-                  print('[DEBUG]   Found "tiktok" keyword in comment');
                 }
                 if (commentLower.contains('whatsapp')) {
                   platformStatus['whatsapp'] = true;
                   foundPlatformFromComment = true;
-                  print('[DEBUG]   Found "whatsapp" keyword in comment');
                 }
                 if (commentLower.contains('youtube')) {
                   platformStatus['youtube'] = true;
                   foundPlatformFromComment = true;
-                  print('[DEBUG]   Found "youtube" keyword in comment');
+                }
+                if (commentLower.contains('instagram') || commentLower.contains('cdninstagram')) {
+                  platformStatus['instagram'] = true;
+                  foundPlatformFromComment = true;
                 }
               }
-            } else {
-              print('[DEBUG]   Raw Rule comment is empty, will use IP-based detection');
             }
             
             // اگر از comment چیزی پیدا نشد، از IP addresses در Address-List استفاده کن
             if (!foundPlatformFromComment) {
-              print('[DEBUG]   No platform found from comment, checking Address-List IPs...');
               // این بخش بعداً در حلقه Address-List entries انجام می‌شود
             }
           }
@@ -6668,10 +6672,10 @@ class MikroTikService {
             final commentLower = comment.toLowerCase();
             if (commentLower.contains('telegram')) platformStatus['telegram'] = true;
             if (commentLower.contains('facebook') || commentLower.contains('fb.com')) platformStatus['facebook'] = true;
-            if (commentLower.contains('instagram')) platformStatus['instagram'] = true;
             if (commentLower.contains('tiktok')) platformStatus['tiktok'] = true;
             if (commentLower.contains('whatsapp')) platformStatus['whatsapp'] = true;
             if (commentLower.contains('youtube') || commentLower.contains('googlevideo')) platformStatus['youtube'] = true;
+            if (commentLower.contains('instagram') || commentLower.contains('cdninstagram')) platformStatus['instagram'] = true;
           }
           
           // بررسی Address-List rules (حتی اگر comment متفاوت باشد)
@@ -6683,10 +6687,10 @@ class MikroTikService {
               final commentLower = comment.toLowerCase();
               if (commentLower.contains('telegram')) platformStatus['telegram'] = true;
               if (commentLower.contains('facebook') || commentLower.contains('fb')) platformStatus['facebook'] = true;
-              if (commentLower.contains('instagram')) platformStatus['instagram'] = true;
               if (commentLower.contains('tiktok')) platformStatus['tiktok'] = true;
               if (commentLower.contains('whatsapp')) platformStatus['whatsapp'] = true;
               if (commentLower.contains('youtube')) platformStatus['youtube'] = true;
+              if (commentLower.contains('instagram') || commentLower.contains('cdninstagram')) platformStatus['instagram'] = true;
             }
           }
           
@@ -6724,7 +6728,6 @@ class MikroTikService {
             
             if (hasYouTubeRawRule) {
               platformStatus['youtube'] = true;
-              print('[DEBUG]   Found YouTube TLS Host Detection rule (global) and RAW rule for device: tls-host=$tlsHost');
             }
           }
           
@@ -6737,7 +6740,6 @@ class MikroTikService {
             // بررسی YouTube domains در TLS host
             if (tlsHostLower.contains('youtube') || tlsHostLower.contains('ytimg') || tlsHostLower.contains('googlevideo') || tlsHostLower.contains('ggpht')) {
               platformStatus['youtube'] = true;
-              print('[DEBUG]   Found YouTube domain in TLS host: $tlsHost');
             }
           }
           
@@ -6753,38 +6755,18 @@ class MikroTikService {
       // اگر Raw Rule برای این device وجود دارد که به Blocked-Social اشاره می‌کند،
       // باید همه پلتفرم‌های موجود در Address-List را فعال کنیم
       final allAddressList = await _client!.talk(['/ip/firewall/address-list/print']);
-      print('[DEBUG] Total Address-List entries found: ${allAddressList.length}');
       
       int addressListCount = 0;
       final Set<String> foundPlatforms = <String>{};
       
       // اگر Raw Rule برای این device وجود دارد که به Blocked-Social اشاره می‌کند
       bool hasRawRuleForAddressList = false;
-      print('[DEBUG] Checking all Raw Rules for device $deviceIp...');
-      print('[DEBUG] Total Raw Rules to check: ${allRawRules.length}');
-      
-      // لاگ برای همه Raw Rules (برای debug)
-      for (int i = 0; i < allRawRules.length && i < 10; i++) {
-        final rawRule = allRawRules[i];
-        final srcAddress = rawRule['src-address']?.toString() ?? '';
-        final dstAddressList = rawRule['dst-address-list']?.toString() ?? '';
-        final action = rawRule['action']?.toString() ?? '';
-        final chain = rawRule['chain']?.toString() ?? '';
-        final ruleId = rawRule['.id']?.toString() ?? '';
-        print('[DEBUG] Raw Rule #${i + 1} ID=$ruleId: src-address="$srcAddress", dst-address-list="$dstAddressList", action="$action", chain="$chain"');
-      }
       
       for (final rawRule in allRawRules) {
         final srcAddress = rawRule['src-address']?.toString() ?? '';
         final dstAddressList = rawRule['dst-address-list']?.toString() ?? '';
         final action = rawRule['action']?.toString() ?? '';
         final chain = rawRule['chain']?.toString() ?? '';
-        final ruleId = rawRule['.id']?.toString() ?? '';
-        
-        // لاگ برای همه Raw Rules که به Blocked-Social اشاره می‌کنند
-        if (dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP') {
-          print('[DEBUG] Raw Rule ID=$ruleId: src-address="$srcAddress", deviceIp="$deviceIp", match=${srcAddress == deviceIp}, action="$action", chain="$chain"');
-        }
         
         // بررسی دقیق‌تر: باید action=drop و chain=prerouting باشد
         if (srcAddress == deviceIp && 
@@ -6792,13 +6774,8 @@ class MikroTikService {
             action == 'drop' &&
             chain == 'prerouting') {
           hasRawRuleForAddressList = true;
-          print('[DEBUG] Found Raw Rule for device $deviceIp pointing to Address-List: $dstAddressList');
           break;
         }
-      }
-      
-      if (!hasRawRuleForAddressList) {
-        print('[DEBUG] No Raw Rule found for device $deviceIp pointing to Blocked-Social');
       }
       
       // بررسی اینکه آیا Firewall Rule به Blocked-Social اشاره می‌کند
@@ -6809,7 +6786,6 @@ class MikroTikService {
         if (srcAddress == deviceIp && 
             (dstAddressList == 'Blocked-Social' || dstAddressList == 'Blocked-Social-IP')) {
           hasFirewallRuleForAddressList = true;
-          print('[DEBUG] Found Firewall Rule for device $deviceIp pointing to Address-List: $dstAddressList');
           break;
         }
       }
@@ -6817,47 +6793,26 @@ class MikroTikService {
       // اگر Raw Rule یا Firewall Rule برای Address-List وجود دارد، همه Address-List entries را بررسی کن
       // یا اگر Address-List entries وجود دارند، آن‌ها را بررسی کن (fallback)
       if (hasRawRuleForAddressList || hasFirewallRuleForAddressList || allAddressList.isNotEmpty) {
-        print('[DEBUG] Checking Address-List entries for platforms...');
-        print('[DEBUG] Total Address-List entries to check: ${allAddressList.length}');
-        int entryIndex = 0;
-        int blockedSocialCount = 0;
         for (final entry in allAddressList) {
           final list = entry['list']?.toString() ?? '';
           final comment = entry['comment']?.toString() ?? '';
-          final address = entry['address']?.toString() ?? '';
-          
-          // لاگ برای همه entries (برای debug)
-          if (entryIndex < 10) { // فقط 10 تا اول را لاگ کن
-            print('[DEBUG]   Address-List Entry #${entryIndex + 1}: list="$list", address="$address", comment="$comment"');
-          }
           
           if (list == 'Blocked-Social' || list == 'Blocked-Social-IP') {
-            blockedSocialCount++;
-            print('[DEBUG]   Found Blocked-Social entry #$blockedSocialCount: address="$address", comment="$comment"');
-            entryIndex++;
             addressListCount++;
-            print('[DEBUG]   Address-List Entry #$entryIndex:');
-            print('[DEBUG]     Address: $address');
-            print('[DEBUG]     List: $list');
-            print('[DEBUG]     Comment: $comment');
             
             if (comment.isNotEmpty) {
               final commentLower = comment.toLowerCase();
               
               // بررسی Platforms= یا Platforms- در comment
               if (commentLower.contains('sm-filter:platforms=') || commentLower.contains('sm-filter:platforms-')) {
-                print('[DEBUG]     Found "sm-filter:platforms=" or "sm-filter:platforms-" in comment');
                 final platformsMatch = RegExp(r'sm-filter:platforms[=-]([^|]+)', caseSensitive: false).firstMatch(comment);
                 if (platformsMatch != null) {
                   final platformsStr = platformsMatch.group(1)?.trim() ?? '';
-                  print('[DEBUG]     Extracted platforms string: "$platformsStr"');
                   if (platformsStr.isNotEmpty) {
                     final platformsList = platformsStr.split(',').map((p) => p.trim().toLowerCase()).where((p) => p.isNotEmpty).toList();
-                    print('[DEBUG]     Parsed platforms list: $platformsList');
                     for (final p in platformsList) {
                       if (platformStatus.containsKey(p)) {
                         foundPlatforms.add(p);
-                        print('[DEBUG]     Platform "$p" added to foundPlatforms');
                       }
                     }
                   }
@@ -6866,14 +6821,11 @@ class MikroTikService {
               
               // بررسی Platform= یا Platform- در comment
               if (commentLower.contains('sm-filter:platform=') || commentLower.contains('sm-filter:platform-')) {
-                print('[DEBUG]     Found "sm-filter:platform=" or "sm-filter:platform-" in comment');
                 final platformMatch = RegExp(r'sm-filter:platform[=-]([^|]+)', caseSensitive: false).firstMatch(comment);
                 if (platformMatch != null) {
                   final platformName = platformMatch.group(1)?.trim().toLowerCase() ?? '';
-                  print('[DEBUG]     Extracted platform name: "$platformName"');
                   if (platformName.isNotEmpty && platformStatus.containsKey(platformName)) {
                     foundPlatforms.add(platformName);
-                    print('[DEBUG]     Platform "$platformName" added to foundPlatforms');
                   }
                 }
               }
@@ -6881,30 +6833,19 @@ class MikroTikService {
               // بررسی کلمات کلیدی در comment (fallback)
               if (commentLower.contains('block telegram') || commentLower.contains('telegram')) {
                 foundPlatforms.add('telegram');
-                print('[DEBUG]     Found "telegram" keyword, added to foundPlatforms');
               }
               if (commentLower.contains('block facebook') || commentLower.contains('facebook') || commentLower.contains('fb ')) {
                 foundPlatforms.add('facebook');
-                print('[DEBUG]     Found "facebook" keyword, added to foundPlatforms');
-              }
-              if (commentLower.contains('block instagram') || commentLower.contains('instagram')) {
-                foundPlatforms.add('instagram');
-                print('[DEBUG]     Found "instagram" keyword, added to foundPlatforms');
               }
               if (commentLower.contains('block tiktok') || commentLower.contains('tiktok')) {
                 foundPlatforms.add('tiktok');
-                print('[DEBUG]     Found "tiktok" keyword, added to foundPlatforms');
               }
               if (commentLower.contains('block whatsapp') || commentLower.contains('whatsapp')) {
                 foundPlatforms.add('whatsapp');
-                print('[DEBUG]     Found "whatsapp" keyword, added to foundPlatforms');
               }
               if (commentLower.contains('block youtube') || commentLower.contains('youtube')) {
                 foundPlatforms.add('youtube');
-                print('[DEBUG]     Found "youtube" keyword, added to foundPlatforms');
               }
-            } else {
-              print('[DEBUG]     No comment in this entry, will use IP-based detection');
             }
           }
         }
@@ -6914,8 +6855,6 @@ class MikroTikService {
         // و برای IP های مشترک (مثل 31.13.x.x که هم Facebook و هم WhatsApp است)،
         // باید از comment استفاده کنیم - اگر comment خالی است، از IP استفاده نمی‌کنیم
         if (foundPlatforms.isEmpty && addressListCount > 0) {
-          print('[DEBUG] No platforms found from comments, checking if we can use IP-based detection...');
-          
           // بررسی اینکه آیا همه entries comment خالی دارند
           bool allCommentsEmpty = true;
           for (final entry in allAddressList) {
@@ -6930,7 +6869,6 @@ class MikroTikService {
           // فقط اگر همه comments خالی هستند، از IP-based detection استفاده کن
           // اما برای IP های مشترک (31.13.x.x)، از IP-based detection استفاده نکن
           if (allCommentsEmpty) {
-            print('[DEBUG] All comments are empty, using IP-based detection (with caution for shared IPs)...');
             // بررسی IP addresses برای شناسایی پلتفرم
             for (final entry in allAddressList) {
               final list = entry['list']?.toString() ?? '';
@@ -6941,7 +6879,6 @@ class MikroTikService {
                 // تلگرام: 149.154.x.x و 91.108.x.x (منحصر به فرد)
                 if ((address.startsWith('149.154.') || address.startsWith('91.108.')) && !foundPlatforms.contains('telegram')) {
                   foundPlatforms.add('telegram');
-                  print('[DEBUG]   Detected telegram from IP: $address');
                 }
                 // فیسبوک: IP ranges منحصر به فرد (بدون 31.13.x.x که مشترک است)
                 else if ((address.startsWith('31.13.24.') || address.startsWith('31.13.64.') ||
@@ -6955,45 +6892,29 @@ class MikroTikService {
                          address.startsWith('185.89.') || address.startsWith('204.15.')) && 
                          !foundPlatforms.contains('facebook')) {
                   foundPlatforms.add('facebook');
-                  print('[DEBUG]   Detected facebook from IP: $address');
-                }
-                // اینستاگرام: IP ranges منحصر به فرد
-                else if ((address.startsWith('54.230.') || address.startsWith('54.239.')) && !foundPlatforms.contains('instagram')) {
-                  foundPlatforms.add('instagram');
-                  print('[DEBUG]   Detected instagram from IP: $address');
                 }
                 // تیک‌تاک: 13.107.42.x, 20.42.64.x, 103.27.148.x (منحصر به فرد)
                 else if ((address.startsWith('13.107.42.') || address.startsWith('20.42.64.') ||
                          address.startsWith('103.27.148.')) && !foundPlatforms.contains('tiktok')) {
                   foundPlatforms.add('tiktok');
-                  print('[DEBUG]   Detected tiktok from IP: $address');
                 }
                 // یوتیوب: 172.217.x.x, 142.250.x.x, 74.125.x.x, 216.58.x.x (منحصر به فرد)
                 else if ((address.startsWith('172.217.') || address.startsWith('142.250.') ||
                          address.startsWith('74.125.') || address.startsWith('216.58.')) && !foundPlatforms.contains('youtube')) {
                   foundPlatforms.add('youtube');
-                  print('[DEBUG]   Detected youtube from IP: $address');
                 }
                 // واتساپ و فیسبوک: 31.13.x.x (مشترک) - از IP-based detection استفاده نکن
                 // این IP ها باید از comment شناسایی شوند
                 // اگر comment خالی است، نمی‌توانیم تشخیص دهیم که کدام پلتفرم است
               }
             }
-          } else {
-            print('[DEBUG] Some entries have comments, skipping IP-based detection to avoid false positives');
           }
         }
-        
-        print('[DEBUG] Total Address-List entries in Blocked-Social: $addressListCount');
-        print('[DEBUG] Found platforms from Address-List: $foundPlatforms');
         
         // فعال کردن همه پلتفرم‌های پیدا شده
         for (final platform in foundPlatforms) {
           platformStatus[platform] = true;
-          print('[DEBUG] Platform "$platform" marked as filtered in platformStatus');
         }
-      } else {
-        print('[DEBUG] Skipping Address-List check (no Raw Rule for Address-List)');
       }
 
       // بررسی DNS Static Entries
@@ -7010,17 +6931,6 @@ class MikroTikService {
       // همچنین اگر حداقل یک پلتفرم فیلتر شده باشد
       final hasAnyPlatformFiltered = platformStatus.values.any((status) => status == true);
       final isActive = hasRawRule || hasFirewallRule || hasDNSBypassBlock || addressListCount > 0 || hasAnyPlatformFiltered;
-      
-      // لاگ نهایی
-      print('[DEBUG] ========== Final Status Summary ==========');
-      print('[DEBUG] Device IP: $deviceIp');
-      print('[DEBUG] Has Raw Rule: $hasRawRule');
-      print('[DEBUG] Has Firewall Rule: $hasFirewallRule');
-      print('[DEBUG] Address List Count: $addressListCount');
-      print('[DEBUG] Has Any Platform Filtered: $hasAnyPlatformFiltered');
-      print('[DEBUG] Platform Status: $platformStatus');
-      print('[DEBUG] Is Active: $isActive');
-      print('[DEBUG] ==================================================');
       
       return {
         'is_active': isActive,
@@ -7056,7 +6966,7 @@ class MikroTikService {
     }
 
     final platformLower = platform.toLowerCase();
-    final validPlatforms = ['telegram', 'facebook', 'instagram', 'tiktok', 'whatsapp', 'youtube'];
+    final validPlatforms = ['telegram', 'facebook', 'tiktok', 'whatsapp', 'youtube', 'instagram'];
     
     if (!validPlatforms.contains(platformLower)) {
       throw Exception('پلتفرم نامعتبر: $platform');
@@ -7080,6 +6990,32 @@ class MikroTikService {
         } else if (platformLower == 'youtube') {
           // برای YouTube: استفاده از روش خاص (Mangle + TLS Host Detection + RAW)
           final result = await enableYouTubeFilter(
+            deviceIp,
+            deviceMac: deviceMac,
+            deviceName: deviceName,
+          );
+          return {
+            'success': result['success'] == true,
+            'platform': platformLower,
+            'action': 'enabled',
+            'result': result,
+          };
+        } else if (platformLower == 'instagram') {
+          // برای Instagram: استفاده از روش خاص (Mangle TLS Detection + RAW)
+          final result = await enableInstagramFilter(
+            deviceIp,
+            deviceMac: deviceMac,
+            deviceName: deviceName,
+          );
+          return {
+            'success': result['success'] == true,
+            'platform': platformLower,
+            'action': 'enabled',
+            'result': result,
+          };
+        } else if (platformLower == 'facebook') {
+          // برای Facebook: استفاده از روش خاص (Mangle TLS Detection + RAW)
+          final result = await enableFacebookFilter(
             deviceIp,
             deviceMac: deviceMac,
             deviceName: deviceName,
@@ -7120,6 +7056,20 @@ class MikroTikService {
           };
         } else if (platformLower == 'youtube') {
           final success = await disableYouTubeFilter(deviceIp);
+          return {
+            'success': success,
+            'platform': platformLower,
+            'action': 'disabled',
+          };
+        } else if (platformLower == 'instagram') {
+          final success = await disableInstagramFilter(deviceIp);
+          return {
+            'success': success,
+            'platform': platformLower,
+            'action': 'disabled',
+          };
+        } else if (platformLower == 'facebook') {
+          final success = await disableFacebookFilter(deviceIp);
           return {
             'success': success,
             'platform': platformLower,
@@ -7212,17 +7162,31 @@ class MikroTikService {
 
       // 2. ایجاد Mangle Rule (mark-routing) - برای Policy Routing
       try {
-        // بررسی اینکه آیا Mangle rule از قبل وجود دارد
+        // بررسی دقیق اینکه آیا Mangle rule از قبل وجود دارد (بر اساس همه فیلدهای مهم)
         final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
         bool mangleRuleExists = false;
+        String? existingRuleId;
         for (final rule in allMangleRules) {
           final dstList = rule['dst-address-list']?.toString() ?? '';
-          final comment = rule['comment']?.toString() ?? '';
           final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final routingMark = rule['new-routing-mark']?.toString() ?? '';
+          
+          // بررسی دقیق بر اساس همه فیلدهای مهم (بدون توجه به comment)
           if (dstList == addressListName && 
               action == 'mark-routing' && 
-              comment.contains('Telegram')) {
+              chain == 'prerouting' &&
+              routingMark == 'VPN') {
             mangleRuleExists = true;
+            existingRuleId = rule['.id']?.toString();
+            // اگر rule disabled است، آن را enable کنیم
+            if (rule['disabled'] == true && existingRuleId != null) {
+              await _client!.talk([
+                '/ip/firewall/mangle/set',
+                '=.id=$existingRuleId',
+                '=disabled=no',
+              ]);
+            }
             break;
           }
         }
@@ -7240,6 +7204,7 @@ class MikroTikService {
           results['mangle_rule'] = 'created';
         } else {
           results['mangle_rule'] = 'already_exists';
+          print('[Telegram Filter] Mangle Rule از قبل وجود دارد، اضافه نشد');
         }
       } catch (e) {
         errors.add('خطا در ایجاد Mangle Rule: $e');
@@ -7354,8 +7319,95 @@ class MikroTikService {
         print('[Telegram Filter] خطا در حذف RAW Rule: $e');
       }
 
-      // توجه: Mangle Rule و Address List را حذف نمی‌کنیم چون ممکن است سایر دستگاه‌ها از آن استفاده کنند
-      // فقط RAW Rule device-specific را حذف می‌کنیم
+      // 2. حذف Mangle Rules مربوط به Telegram detection
+      // بررسی دقیق بر اساس tls-host و سایر فیلدهای مهم (بدون توجه به addressList که ممکن است خالی باشد)
+      try {
+        print('[Telegram Filter] ========== شروع حذف Mangle Rules ==========');
+        final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
+        print('[Telegram Filter] تعداد کل Mangle Rules موجود: ${allMangleRules.length}');
+        
+        int mangleRemovedCount = 0;
+        
+        for (final rule in allMangleRules) {
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final routingMark = rule['new-routing-mark']?.toString() ?? '';
+          final ruleId = rule['.id']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          
+          // بررسی Mangle rule برای Telegram (mark-routing)
+          bool isTelegramRule = dstList == addressListName &&
+              action == 'mark-routing' &&
+              chain == 'prerouting' &&
+              routingMark == 'VPN';
+          
+          // همچنین بررسی comment برای اطمینان بیشتر
+          if (isTelegramRule && comment.isNotEmpty) {
+            final commentLower = comment.toLowerCase();
+            if (commentLower.contains('telegram')) {
+              isTelegramRule = true;
+            }
+          }
+          
+          if (isTelegramRule) {
+            print('[Telegram Filter]   Rule پیدا شد برای حذف - ID: $ruleId');
+            print('[Telegram Filter]     dst-address-list: "$dstList"');
+            print('[Telegram Filter]     action: "$action"');
+            print('[Telegram Filter]     comment: "$comment"');
+            
+            if (ruleId.isNotEmpty) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/mangle/remove',
+                  '=.id=$ruleId',
+                ]);
+                mangleRemovedCount++;
+                removedCount++;
+                print('[Telegram Filter]   ✓ Mangle Rule حذف شد: $ruleId');
+              } catch (e) {
+                print('[Telegram Filter]   ✗ خطا در حذف Mangle Rule $ruleId: $e');
+              }
+            }
+          }
+        }
+        
+        print('[Telegram Filter] تعداد Mangle Rules حذف شده: $mangleRemovedCount');
+        print('[Telegram Filter] ========== پایان حذف Mangle Rules ==========');
+      } catch (e) {
+        print('[Telegram Filter] خطا در حذف Mangle Rules: $e');
+      }
+
+      // 3. حذف Address List entries مربوط به Telegram
+      try {
+        final allAddressList = await _client!.talk(['/ip/firewall/address-list/print']);
+        int addressListRemoved = 0;
+        
+        for (final entry in allAddressList) {
+          final list = entry['list']?.toString() ?? '';
+          
+          if (list == addressListName) {
+            final entryId = entry['.id']?.toString();
+            if (entryId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/address-list/remove',
+                  '=.id=$entryId',
+                ]);
+                addressListRemoved++;
+              } catch (e) {
+                print('[Telegram Filter] خطا در حذف Address List entry $entryId: $e');
+              }
+            }
+          }
+        }
+        
+        if (addressListRemoved > 0) {
+          print('[Telegram Filter] $addressListRemoved Address List entries حذف شدند از $addressListName');
+        }
+      } catch (e) {
+        print('[Telegram Filter] خطا در حذف Address List entries: $e');
+      }
 
       return removedCount > 0;
     } catch (e) {
@@ -7385,17 +7437,31 @@ class MikroTikService {
       // 1. ایجاد Mangle Rule (mark-routing) - برای Policy Routing
       const addressListName = 'YouTube';
       try {
-        // بررسی اینکه آیا Mangle rule از قبل وجود دارد
+        // بررسی دقیق اینکه آیا Mangle rule از قبل وجود دارد (بر اساس همه فیلدهای مهم)
         final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
         bool mangleRuleExists = false;
+        String? existingRuleId;
         for (final rule in allMangleRules) {
           final dstList = rule['dst-address-list']?.toString() ?? '';
-          final comment = rule['comment']?.toString() ?? '';
           final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final routingMark = rule['new-routing-mark']?.toString() ?? '';
+          
+          // بررسی دقیق بر اساس همه فیلدهای مهم (بدون توجه به comment)
           if (dstList == addressListName && 
               action == 'mark-routing' && 
-              comment.contains('Youtube')) {
+              chain == 'prerouting' &&
+              routingMark == 'VPN') {
             mangleRuleExists = true;
+            existingRuleId = rule['.id']?.toString();
+            // اگر rule disabled است، آن را enable کنیم
+            if (rule['disabled'] == true && existingRuleId != null) {
+              await _client!.talk([
+                '/ip/firewall/mangle/set',
+                '=.id=$existingRuleId',
+                '=disabled=no',
+              ]);
+            }
             break;
           }
         }
@@ -7413,6 +7479,7 @@ class MikroTikService {
           results['mangle_rule'] = 'created';
         } else {
           results['mangle_rule'] = 'already_exists';
+          print('[YouTube Filter] Mangle Rule از قبل وجود دارد، اضافه نشد');
         }
       } catch (e) {
         errors.add('خطا در ایجاد Mangle Rule: $e');
@@ -7431,18 +7498,34 @@ class MikroTikService {
       try {
         final allFilterRules = await _client!.talk(['/ip/firewall/filter/print']);
         for (final domain in youtubeDomains) {
-          // بررسی اینکه آیا rule از قبل وجود دارد
+          // بررسی دقیق اینکه آیا rule از قبل وجود دارد (بر اساس همه فیلدهای مهم)
           bool ruleExists = false;
+          String? existingRuleId;
           for (final rule in allFilterRules) {
             final tlsHost = rule['tls-host']?.toString() ?? '';
-            final comment = rule['comment']?.toString() ?? '';
             final action = rule['action']?.toString() ?? '';
             final addressList = rule['dst-address-list']?.toString() ?? '';
+            final chain = rule['chain']?.toString() ?? '';
+            final protocol = rule['protocol']?.toString() ?? '';
+            final dstPort = rule['dst-port']?.toString() ?? '';
+            
+            // بررسی دقیق بر اساس همه فیلدهای مهم (بدون توجه به comment)
             if (tlsHost == domain &&
                 action == 'add-dst-to-address-list' &&
                 addressList == addressListName &&
-                comment.contains('Youtube')) {
+                chain == 'forward' &&
+                protocol == 'tcp' &&
+                dstPort == '443') {
               ruleExists = true;
+              existingRuleId = rule['.id']?.toString();
+              // اگر rule disabled است، آن را enable کنیم
+              if (rule['disabled'] == true && existingRuleId != null) {
+                await _client!.talk([
+                  '/ip/firewall/filter/set',
+                  '=.id=$existingRuleId',
+                  '=disabled=no',
+                ]);
+              }
               break;
             }
           }
@@ -7464,6 +7547,8 @@ class MikroTikService {
             } catch (e) {
               print('[YouTube Filter] خطا در ایجاد TLS Host Detection rule برای $domain: $e');
             }
+          } else {
+            print('[YouTube Filter] Filter Rule از قبل وجود دارد برای $domain، اضافه نشد');
           }
         }
         results['tls_host_detection_rules'] = tlsHostRulesCount;
@@ -7580,14 +7665,1003 @@ class MikroTikService {
         print('[YouTube Filter] خطا در حذف RAW Rule: $e');
       }
 
-      // توجه: Mangle Rule و TLS Host Detection Rules را حذف نمی‌کنیم چون ممکن است سایر دستگاه‌ها از آن استفاده کنند
-      // فقط RAW Rule device-specific را حذف می‌کنیم
+      // 2. حذف Mangle Rules مربوط به YouTube (mark-routing)
+      try {
+        print('[YouTube Filter] ========== شروع حذف Mangle Rules ==========');
+        final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
+        print('[YouTube Filter] تعداد کل Mangle Rules موجود: ${allMangleRules.length}');
+        
+        int mangleRemovedCount = 0;
+        
+        for (final rule in allMangleRules) {
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final routingMark = rule['new-routing-mark']?.toString() ?? '';
+          final ruleId = rule['.id']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          
+          // بررسی Mangle rule برای YouTube (mark-routing)
+          bool isYouTubeRule = dstList == addressListName &&
+              action == 'mark-routing' &&
+              chain == 'prerouting' &&
+              routingMark == 'VPN';
+          
+          // همچنین بررسی comment برای اطمینان بیشتر
+          if (isYouTubeRule && comment.isNotEmpty) {
+            final commentLower = comment.toLowerCase();
+            if (commentLower.contains('youtube') || commentLower.contains('youtube')) {
+              isYouTubeRule = true;
+            }
+          }
+          
+          if (isYouTubeRule) {
+            print('[YouTube Filter]   Rule پیدا شد برای حذف - ID: $ruleId');
+            print('[YouTube Filter]     dst-address-list: "$dstList"');
+            print('[YouTube Filter]     action: "$action"');
+            print('[YouTube Filter]     comment: "$comment"');
+            
+            if (ruleId.isNotEmpty) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/mangle/remove',
+                  '=.id=$ruleId',
+                ]);
+                mangleRemovedCount++;
+                removedCount++;
+                print('[YouTube Filter]   ✓ Mangle Rule حذف شد: $ruleId');
+              } catch (e) {
+                print('[YouTube Filter]   ✗ خطا در حذف Mangle Rule $ruleId: $e');
+              }
+            }
+          }
+        }
+        
+        print('[YouTube Filter] تعداد Mangle Rules حذف شده: $mangleRemovedCount');
+        print('[YouTube Filter] ========== پایان حذف Mangle Rules ==========');
+      } catch (e) {
+        print('[YouTube Filter] خطا در حذف Mangle Rules: $e');
+      }
+
+      // 3. حذف TLS Host Detection Rules (Filter Rules)
+      try {
+        print('[YouTube Filter] ========== شروع حذف TLS Host Detection Rules ==========');
+        final allFilterRules = await _client!.talk(['/ip/firewall/filter/print']);
+        print('[YouTube Filter] تعداد کل Filter Rules موجود: ${allFilterRules.length}');
+        
+        final youtubeDomains = ['*youtube*', '*ytimg*', '*googlevideo*', '*ggpht*'];
+        int filterRemovedCount = 0;
+        
+        for (final rule in allFilterRules) {
+          final tlsHost = rule['tls-host']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final addressList = rule['dst-address-list']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final protocol = rule['protocol']?.toString() ?? '';
+          final dstPort = rule['dst-port']?.toString() ?? '';
+          final ruleId = rule['.id']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          
+          // بررسی دقیق: اگر tls-host مربوط به YouTube است و سایر فیلدها مطابق هستند
+          bool isYouTubeRule = youtubeDomains.contains(tlsHost) &&
+              action == 'add-dst-to-address-list' &&
+              chain == 'forward' &&
+              protocol == 'tcp' &&
+              dstPort == '443';
+          
+          // اگر addressList خالی نیست، باید YouTube باشد
+          if (isYouTubeRule && addressList.isNotEmpty && addressList != addressListName) {
+            isYouTubeRule = false;
+          }
+          
+          // همچنین بررسی comment برای اطمینان بیشتر
+          if (isYouTubeRule && comment.isNotEmpty) {
+            final commentLower = comment.toLowerCase();
+            if (commentLower.contains('youtube')) {
+              isYouTubeRule = true;
+            }
+          }
+          
+          if (isYouTubeRule) {
+            print('[YouTube Filter]   Rule پیدا شد برای حذف - ID: $ruleId');
+            print('[YouTube Filter]     tls-host: "$tlsHost"');
+            print('[YouTube Filter]     action: "$action"');
+            print('[YouTube Filter]     dst-address-list: "$addressList"');
+            print('[YouTube Filter]     comment: "$comment"');
+            
+            if (ruleId.isNotEmpty) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/filter/remove',
+                  '=.id=$ruleId',
+                ]);
+                filterRemovedCount++;
+                removedCount++;
+                print('[YouTube Filter]   ✓ TLS Host Detection Rule حذف شد: $ruleId');
+              } catch (e) {
+                print('[YouTube Filter]   ✗ خطا در حذف TLS Host Detection Rule $ruleId: $e');
+              }
+            }
+          }
+        }
+        
+        print('[YouTube Filter] تعداد TLS Host Detection Rules حذف شده: $filterRemovedCount');
+        print('[YouTube Filter] ========== پایان حذف TLS Host Detection Rules ==========');
+      } catch (e) {
+        print('[YouTube Filter] خطا در حذف TLS Host Detection Rules: $e');
+      }
+
+      // 4. حذف Address List entries مربوط به YouTube
+      try {
+        final allAddressList = await _client!.talk(['/ip/firewall/address-list/print']);
+        int addressListRemoved = 0;
+        
+        for (final entry in allAddressList) {
+          final list = entry['list']?.toString() ?? '';
+          
+          if (list == addressListName) {
+            final entryId = entry['.id']?.toString();
+            if (entryId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/address-list/remove',
+                  '=.id=$entryId',
+                ]);
+                addressListRemoved++;
+              } catch (e) {
+                print('[YouTube Filter] خطا در حذف Address List entry $entryId: $e');
+              }
+            }
+          }
+        }
+        
+        if (addressListRemoved > 0) {
+          print('[YouTube Filter] $addressListRemoved Address List entries حذف شدند از $addressListName');
+        }
+      } catch (e) {
+        print('[YouTube Filter] خطا در حذف Address List entries: $e');
+      }
 
       return removedCount > 0;
     } catch (e) {
       throw Exception('خطا در غیرفعال‌سازی فیلترینگ YouTube: $e');
     }
   }
+
+  /// فعال‌سازی فیلترینگ Instagram با استفاده از Mangle TLS Detection + RAW
+  /// طبق توضیحات کاربر: Mangle (TLS Host Detection) + RAW (drop)
+  Future<Map<String, dynamic>> enableInstagramFilter(
+    String deviceIp, {
+    String? deviceMac,
+    String? deviceName,
+  }) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (deviceIp.isEmpty) {
+      throw Exception('آدرس IP دستگاه الزامی است');
+    }
+
+    try {
+      final results = <String, dynamic>{};
+      final errors = <String>[];
+
+      const addressListName = 'Instagram';
+
+      // 0. اطمینان از غیرفعال شدن QUIC (UDP/443) برای امکان تشخیص TLS
+      // این Rule مطابق راهنمای شما، قبل از همه چیز QUIC را Drop می‌کند
+      try {
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        bool quicRuleExists = false;
+
+        for (final rule in allRawRules) {
+          final protocol = rule['protocol']?.toString() ?? '';
+          final dstPort = rule['dst-port']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+
+          if (protocol == 'udp' &&
+              dstPort == '443' &&
+              chain == 'prerouting' &&
+              action == 'drop' &&
+              (comment.contains('Drop QUIC (Force HTTPS)') ||
+               comment.contains('Drop QUIC'))) {
+            quicRuleExists = true;
+            break;
+          }
+        }
+
+        if (!quicRuleExists) {
+          await _client!.talk([
+            '/ip/firewall/raw/add',
+            '=chain=prerouting',
+            '=protocol=udp',
+            '=dst-port=443',
+            '=action=drop',
+            '=comment=Drop QUIC (Force HTTPS)',
+          ]);
+          results['quic_rule'] = 'created';
+        } else {
+          results['quic_rule'] = 'already_exists';
+        }
+      } catch (e) {
+        // اگر Rule ساختن QUIC خطا داد، در لاگ بنویس ولی فیلترینگ را ادامه بده
+        errors.add('خطا در ایجاد Drop QUIC Rule: $e');
+      }
+
+      // 1. ایجاد Mangle Rules (TLS Host Detection) - برای تشخیص دامنه‌های Instagram
+      // طبق توضیحات: استفاده از chain=prerouting, protocol=tcp, dst-port=443, tls-host
+      final instagramDomains = [
+        '*.instagram.com',
+        '*.cdninstagram.com',
+      ];
+
+      int mangleRulesCount = 0;
+      try {
+        final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
+        for (final domain in instagramDomains) {
+          // بررسی دقیق اینکه آیا rule از قبل وجود دارد (بر اساس همه فیلدهای مهم، نه فقط comment)
+          bool ruleExists = false;
+          String? existingRuleId;
+          for (final rule in allMangleRules) {
+            final tlsHost = rule['tls-host']?.toString() ?? '';
+            final action = rule['action']?.toString() ?? '';
+            final addressList = rule['dst-address-list']?.toString() ?? '';
+            final chain = rule['chain']?.toString() ?? '';
+            final protocol = rule['protocol']?.toString() ?? '';
+            final dstPort = rule['dst-port']?.toString() ?? '';
+            
+            // بررسی دقیق بر اساس همه فیلدهای مهم (بدون توجه به comment)
+            if (tlsHost == domain &&
+                action == 'add-dst-to-address-list' &&
+                addressList == addressListName &&
+                chain == 'prerouting' &&
+                protocol == 'tcp' &&
+                dstPort == '443') {
+              ruleExists = true;
+              existingRuleId = rule['.id']?.toString();
+              // اگر rule disabled است، آن را enable کنیم
+              if (rule['disabled'] == true) {
+                if (existingRuleId != null) {
+                  await _client!.talk([
+                    '/ip/firewall/mangle/set',
+                    '=.id=$existingRuleId',
+                    '=disabled=no',
+                  ]);
+                }
+              }
+              break;
+            }
+          }
+
+          if (!ruleExists) {
+            try {
+              await _client!.talk([
+                '/ip/firewall/mangle/add',
+                '=chain=prerouting',
+                '=protocol=tcp',
+                '=dst-port=443',
+                '=tls-host=$domain',
+                '=action=add-dst-to-address-list',
+                '=address-list=$addressListName',
+                '=address-list-timeout=1d',
+                '=comment=${domain == '*.instagram.com' ? 'Detect Instagram Main Domain' : 'Detect Instagram CDN'}',
+              ]);
+              mangleRulesCount++;
+            } catch (e) {
+              print('[Instagram Filter] خطا در ایجاد Mangle rule برای $domain: $e');
+              errors.add('خطا در ایجاد Mangle rule برای $domain: $e');
+            }
+          } else {
+            print('[Instagram Filter] Mangle Rule از قبل وجود دارد برای $domain، اضافه نشد');
+          }
+        }
+        results['mangle_rules'] = mangleRulesCount;
+      } catch (e) {
+        errors.add('خطا در ایجاد Mangle Rules: $e');
+      }
+
+      // 2. ایجاد RAW Rule (drop) - برای فیلترینگ دستگاه خاص
+      try {
+        // ابتدا همه RAW rules مربوط به Instagram filtering این دستگاه را حذف کن
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        final rulesToRemove = <String>[];
+        for (final rule in allRawRules) {
+          final srcAddr = rule['src-address']?.toString() ?? '';
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+
+          if (srcAddr == deviceIp &&
+              dstList == addressListName &&
+              action == 'drop' &&
+              chain == 'prerouting' &&
+              (comment.contains('Instagram Filtering') ||
+               comment.contains('Block Instagram Traffic'))) {
+            final ruleId = rule['.id']?.toString();
+            if (ruleId != null) {
+              rulesToRemove.add(ruleId);
+            }
+          }
+        }
+
+        // حذف همه rules قدیمی
+        for (final ruleId in rulesToRemove) {
+          try {
+            await _client!.talk([
+              '/ip/firewall/raw/remove',
+              '=.id=$ruleId',
+            ]);
+            print('[Instagram Filter] RAW Rule قدیمی حذف شد: $ruleId');
+          } catch (e) {
+            print('[Instagram Filter] خطا در حذف RAW Rule قدیمی $ruleId: $e');
+          }
+        }
+
+        // ایجاد RAW Rule جدید با کامنت استاندارد
+        final rawRuleParams = <String, String>{
+          'chain': 'prerouting',
+          'src-address': deviceIp,
+          'dst-address-list': addressListName,
+          'action': 'drop',
+          'comment': 'Block Instagram Traffic',
+          'disabled': 'no', // فعال
+        };
+
+        if (deviceMac != null && deviceMac.isNotEmpty) {
+          rawRuleParams['src-mac-address'] = deviceMac;
+        }
+
+        final rawCommand = <String>['/ip/firewall/raw/add'];
+        rawRuleParams.forEach((key, value) {
+          rawCommand.add('=$key=$value');
+        });
+
+        await _client!.talk(rawCommand);
+        results['raw_rule'] = 'created';
+        results['old_rules_removed'] = rulesToRemove.length;
+      } catch (e) {
+        errors.add('خطا در ایجاد RAW Rule: $e');
+      }
+
+      return {
+        'success': errors.isEmpty,
+        'device_ip': deviceIp,
+        'address_list_name': addressListName,
+        'mangle_rules': mangleRulesCount,
+        'errors': errors,
+        'results': results,
+      };
+    } catch (e) {
+      throw Exception('خطا در فعال‌سازی فیلترینگ Instagram: $e');
+    }
+  }
+
+  /// غیرفعال‌سازی فیلترینگ Instagram برای یک دستگاه
+  Future<bool> disableInstagramFilter(String deviceIp) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (deviceIp.isEmpty) {
+      throw Exception('آدرس IP دستگاه الزامی است');
+    }
+
+    try {
+      const addressListName = 'Instagram';
+      int removedCount = 0;
+
+      // 1. حذف کامل RAW Rule های مربوط به Instagram (شامل Drop روی Address-List و Rule های QUIC مرتبط)
+      try {
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (final rule in allRawRules) {
+          final srcAddr = rule['src-address']?.toString() ?? '';
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final protocol = rule['protocol']?.toString() ?? '';
+          final dstPort = rule['dst-port']?.toString() ?? '';
+
+          // حذف Rule های Drop مخصوص این دستگاه روی Address-List Instagram
+          if (srcAddr == deviceIp &&
+              dstList == addressListName &&
+              action == 'drop' &&
+              chain == 'prerouting' &&
+              (comment.contains('Instagram Filtering') ||
+               comment.contains('Block Instagram Traffic'))) {
+            final ruleId = rule['.id']?.toString();
+            if (ruleId != null) {
+              await _client!.talk([
+                '/ip/firewall/raw/remove',
+                '=.id=$ruleId',
+              ]);
+              removedCount++;
+              print('[Instagram Filter] RAW Rule حذف شد برای $deviceIp: $ruleId');
+              continue;
+            }
+          }
+
+          // حذف Rule های Drop QUIC مرتبط با Instagram (ایجاد شده در enableInstagramFilter)
+          if (protocol == 'udp' &&
+              dstPort == '443' &&
+              action == 'drop' &&
+              chain == 'prerouting' &&
+              (comment.contains('Drop QUIC (Force HTTPS)') ||
+               comment.contains('Drop Instagram') ||
+               comment.contains('Drop QUIC'))) {
+            final quicRuleId = rule['.id']?.toString();
+            if (quicRuleId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/raw/remove',
+                  '=.id=$quicRuleId',
+                ]);
+                print('[Instagram Filter] QUIC RAW Rule حذف شد: $quicRuleId');
+              } catch (e) {
+                print('[Instagram Filter] خطا در حذف QUIC RAW Rule $quicRuleId: $e');
+              }
+            }
+          }
+        }
+      } catch (e) {
+        print('[Instagram Filter] خطا در حذف RAW Rule: $e');
+      }
+
+      // 2. حذف Mangle Rules مربوط به Instagram detection
+      // بررسی دقیق بر اساس tls-host و سایر فیلدهای مهم (بدون توجه به addressList که ممکن است خالی باشد)
+      try {
+        print('[Instagram Filter] ========== شروع حذف Mangle Rules ==========');
+        final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
+        print('[Instagram Filter] تعداد کل Mangle Rules موجود: ${allMangleRules.length}');
+        
+        final instagramDomains = ['*.instagram.com', '*.cdninstagram.com'];
+        int mangleRemovedCount = 0;
+        
+        for (final rule in allMangleRules) {
+          final tlsHost = rule['tls-host']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final addressList = rule['dst-address-list']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final protocol = rule['protocol']?.toString() ?? '';
+          final dstPort = rule['dst-port']?.toString() ?? '';
+          final ruleId = rule['.id']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          
+          // بررسی دقیق: اگر tls-host مربوط به Instagram است و سایر فیلدها مطابق هستند
+          bool isInstagramRule = instagramDomains.contains(tlsHost) &&
+              action == 'add-dst-to-address-list' &&
+              chain == 'prerouting' &&
+              protocol == 'tcp' &&
+              dstPort == '443';
+          
+          // اگر addressList خالی نیست، باید Instagram باشد
+          if (isInstagramRule && addressList.isNotEmpty && addressList != addressListName) {
+            isInstagramRule = false;
+          }
+          
+          // همچنین بررسی comment برای اطمینان بیشتر
+          if (isInstagramRule && comment.isNotEmpty) {
+            final commentLower = comment.toLowerCase();
+            if (commentLower.contains('instagram') || commentLower.contains('detect instagram')) {
+              isInstagramRule = true;
+            }
+          }
+          
+          if (isInstagramRule) {
+            print('[Instagram Filter]   Rule پیدا شد برای حذف - ID: $ruleId');
+            print('[Instagram Filter]     tls-host: "$tlsHost"');
+            print('[Instagram Filter]     action: "$action"');
+            print('[Instagram Filter]     dst-address-list: "$addressList"');
+            print('[Instagram Filter]     comment: "$comment"');
+            
+            if (ruleId.isNotEmpty) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/mangle/remove',
+                  '=.id=$ruleId',
+                ]);
+                mangleRemovedCount++;
+                removedCount++;
+                print('[Instagram Filter]   ✓ Mangle Rule حذف شد: $ruleId (tls-host: $tlsHost)');
+              } catch (e) {
+                print('[Instagram Filter]   ✗ خطا در حذف Mangle Rule $ruleId: $e');
+              }
+            }
+          }
+        }
+        
+        print('[Instagram Filter] تعداد Mangle Rules حذف شده: $mangleRemovedCount');
+        print('[Instagram Filter] ========== پایان حذف Mangle Rules ==========');
+      } catch (e) {
+        print('[Instagram Filter] خطا در حذف Mangle Rules: $e');
+      }
+
+      // 3. حذف Address List entries مربوط به Instagram
+      try {
+        final allAddressList = await _client!.talk(['/ip/firewall/address-list/print']);
+        int addressListRemoved = 0;
+
+        for (final entry in allAddressList) {
+          final list = entry['list']?.toString() ?? '';
+
+          if (list == addressListName) {
+            final entryId = entry['.id']?.toString();
+            if (entryId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/address-list/remove',
+                  '=.id=$entryId',
+                ]);
+                addressListRemoved++;
+              } catch (e) {
+                print('[Instagram Filter] خطا در حذف Address List entry $entryId: $e');
+              }
+            }
+          }
+        }
+
+        if (addressListRemoved > 0) {
+          print('[Instagram Filter] $addressListRemoved Address List entries حذف شدند از $addressListName');
+        }
+      } catch (e) {
+        print('[Instagram Filter] خطا در حذف Address List entries: $e');
+      }
+
+      return removedCount > 0;
+    } catch (e) {
+      throw Exception('خطا در غیرفعال‌سازی فیلترینگ Instagram: $e');
+    }
+  }
+
+  /// فعال‌سازی فیلترینگ Facebook با استفاده از Mangle TLS Detection + RAW
+  /// طبق توضیحات کاربر: Mangle (TLS Host Detection) + RAW (drop)
+  Future<Map<String, dynamic>> enableFacebookFilter(
+    String deviceIp, {
+    String? deviceMac,
+    String? deviceName,
+  }) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (deviceIp.isEmpty) {
+      throw Exception('آدرس IP دستگاه الزامی است');
+    }
+
+    try {
+      final results = <String, dynamic>{};
+      final errors = <String>[];
+
+      const addressListName = 'FaceBook';
+
+      // 1. ایجاد Mangle Rules (TLS Host Detection) - برای تشخیص دامنه‌های Facebook
+      // طبق توضیحات: استفاده از chain=prerouting, protocol=tcp, dst-port=443, tls-host
+      final facebookDomains = [
+        '*.facebook.com',
+        '*.fbcdn.net',
+      ];
+
+      int mangleRulesCount = 0;
+      try {
+        print('[Facebook Filter] ========== شروع بررسی Mangle Rules ==========');
+        print('[Facebook Filter] Device IP: $deviceIp');
+        print('[Facebook Filter] Address List Name: $addressListName');
+        print('[Facebook Filter] Domains to check: $facebookDomains');
+        
+        // بررسی دقیق اینکه آیا Mangle rule از قبل وجود دارد (مشابه Telegram)
+        final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
+        print('[Facebook Filter] تعداد کل Mangle Rules موجود: ${allMangleRules.length}');
+        
+        for (final domain in facebookDomains) {
+          print('[Facebook Filter] --- بررسی دامنه: $domain ---');
+          bool ruleExists = false;
+          String? existingRuleId;
+          int matchingRulesCount = 0;
+          
+          for (final rule in allMangleRules) {
+            final tlsHost = rule['tls-host']?.toString() ?? '';
+            final action = rule['action']?.toString() ?? '';
+            final addressList = rule['dst-address-list']?.toString() ?? '';
+            final chain = rule['chain']?.toString() ?? '';
+            final protocol = rule['protocol']?.toString() ?? '';
+            final dstPort = rule['dst-port']?.toString() ?? '';
+            final disabled = rule['disabled']?.toString() ?? 'false';
+            final ruleId = rule['.id']?.toString() ?? '';
+            final comment = rule['comment']?.toString() ?? '';
+            
+            // بررسی جزئیات برای لاگ
+            bool tlsHostMatch = tlsHost == domain;
+            bool actionMatch = action == 'add-dst-to-address-list';
+            bool addressListMatch = addressList == addressListName;
+            bool chainMatch = chain == 'prerouting';
+            bool protocolMatch = protocol == 'tcp';
+            bool dstPortMatch = dstPort == '443';
+            
+            if (tlsHostMatch || actionMatch || addressListMatch) {
+              matchingRulesCount++;
+              print('[Facebook Filter]   Rule #$matchingRulesCount - ID: $ruleId');
+              print('[Facebook Filter]     tls-host: "$tlsHost" (match: $tlsHostMatch, expected: $domain)');
+              print('[Facebook Filter]     action: "$action" (match: $actionMatch, expected: add-dst-to-address-list)');
+              print('[Facebook Filter]     dst-address-list: "$addressList" (match: $addressListMatch, expected: $addressListName)');
+              print('[Facebook Filter]     chain: "$chain" (match: $chainMatch, expected: prerouting)');
+              print('[Facebook Filter]     protocol: "$protocol" (match: $protocolMatch, expected: tcp)');
+              print('[Facebook Filter]     dst-port: "$dstPort" (match: $dstPortMatch, expected: 443)');
+              print('[Facebook Filter]     disabled: $disabled');
+              print('[Facebook Filter]     comment: "$comment"');
+            }
+            
+            // بررسی دقیق بر اساس tls-host و سایر فیلدهای مهم
+            // اگر tls-host و سایر فیلدها مطابق هستند، rule را پیدا کرده‌ایم
+            bool tlsHostMatches = tlsHost == domain;
+            bool actionMatches = action == 'add-dst-to-address-list';
+            bool chainMatches = chain == 'prerouting';
+            bool protocolMatches = protocol == 'tcp';
+            bool dstPortMatches = dstPort == '443';
+            
+            if (tlsHostMatches &&
+                actionMatches &&
+                chainMatches &&
+                protocolMatches &&
+                dstPortMatches) {
+              // Rule پیدا شد (حتی اگر addressList خالی یا متفاوت باشد)
+              ruleExists = true;
+              existingRuleId = ruleId;
+              print('[Facebook Filter]   ✓ Rule با tls-host مطابق پیدا شد! ID: $existingRuleId');
+              print('[Facebook Filter]   disabled status: $disabled');
+              print('[Facebook Filter]   address-list فعلی: "$addressList" (expected: $addressListName)');
+              
+              // اگر addressList خالی است یا متفاوت است، باید آن را به‌روزرسانی کنیم
+              if (addressList != addressListName && existingRuleId.isNotEmpty) {
+                print('[Facebook Filter]   → address-list نادرست است، در حال به‌روزرسانی...');
+                try {
+                  await _client!.talk([
+                    '/ip/firewall/mangle/set',
+                    '=.id=$existingRuleId',
+                    '=dst-address-list=$addressListName',
+                    '=disabled=no',
+                  ]);
+                  print('[Facebook Filter]   ✓ Rule با موفقیت به‌روزرسانی شد (address-list تنظیم شد)');
+                } catch (e) {
+                  print('[Facebook Filter]   ✗ خطا در به‌روزرسانی Rule: $e');
+                  // اگر به‌روزرسانی موفق نبود، rule را حذف می‌کنیم و دوباره ایجاد می‌کنیم
+                  try {
+                    await _client!.talk([
+                      '/ip/firewall/mangle/remove',
+                      '=.id=$existingRuleId',
+                    ]);
+                    print('[Facebook Filter]   → Rule قدیمی حذف شد، rule جدید ایجاد می‌شود');
+                    ruleExists = false;
+                    existingRuleId = '';
+                  } catch (e2) {
+                    print('[Facebook Filter]   ✗ خطا در حذف Rule قدیمی: $e2');
+                  }
+                }
+              } else if (disabled == 'true') {
+                // اگر rule disabled است، آن را enable کنیم
+                print('[Facebook Filter]   → Rule disabled است، در حال enable کردن...');
+                await _client!.talk([
+                  '/ip/firewall/mangle/set',
+                  '=.id=$existingRuleId',
+                  '=disabled=no',
+                ]);
+                print('[Facebook Filter]   ✓ Rule با موفقیت enable شد');
+              } else {
+                print('[Facebook Filter]   → Rule از قبل فعال و صحیح است');
+              }
+              break;
+            }
+          }
+          
+          print('[Facebook Filter]   تعداد Rules با فیلدهای مشترک: $matchingRulesCount');
+          print('[Facebook Filter]   Rule کامل مطابق: ${ruleExists ? "بله (ID: $existingRuleId)" : "خیر"}');
+          
+          if (!ruleExists) {
+            print('[Facebook Filter]   → Rule جدید ایجاد می‌شود...');
+            try {
+              await _client!.talk([
+                '/ip/firewall/mangle/add',
+                '=chain=prerouting',
+                '=protocol=tcp',
+                '=dst-port=443',
+                '=tls-host=$domain',
+                '=action=add-dst-to-address-list',
+                '=address-list=$addressListName',
+                '=address-list-timeout=1d',
+                '=comment=${domain == '*.facebook.com' ? 'Detect Facebook Main' : 'Detect Facebook CDN'}',
+              ]);
+              mangleRulesCount++;
+              print('[Facebook Filter]   ✓ Rule جدید با موفقیت ایجاد شد');
+            } catch (e) {
+              print('[Facebook Filter]   ✗ خطا در ایجاد Mangle rule برای $domain: $e');
+              errors.add('خطا در ایجاد Mangle rule برای $domain: $e');
+            }
+          } else {
+            print('[Facebook Filter]   → Rule از قبل وجود دارد، Rule جدید ایجاد نشد');
+          }
+          print('[Facebook Filter] --- پایان بررسی دامنه: $domain ---');
+        }
+        print('[Facebook Filter] ========== پایان بررسی Mangle Rules ==========');
+        print('[Facebook Filter] تعداد Rules جدید ایجاد شده: $mangleRulesCount');
+        results['mangle_rules'] = mangleRulesCount;
+      } catch (e) {
+        errors.add('خطا در ایجاد Mangle Rules: $e');
+      }
+
+      // 2. ایجاد RAW Rule (drop) - برای فیلترینگ دستگاه خاص
+      try {
+        print('[Facebook Filter] ========== شروع بررسی RAW Rules ==========');
+        print('[Facebook Filter] Device IP: $deviceIp');
+        print('[Facebook Filter] Address List Name: $addressListName');
+        
+        // ابتدا همه RAW rules مربوط به Facebook filtering این دستگاه را حذف کن (برای جلوگیری از duplicate)
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        print('[Facebook Filter] تعداد کل RAW Rules موجود: ${allRawRules.length}');
+        
+        final rulesToRemove = <String>[];
+        int matchingRawRulesCount = 0;
+        
+        for (final rule in allRawRules) {
+          final srcAddr = rule['src-address']?.toString() ?? '';
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final ruleId = rule['.id']?.toString() ?? '';
+          final disabled = rule['disabled']?.toString() ?? 'false';
+          
+          // بررسی جزئیات برای لاگ
+          bool srcAddrMatch = srcAddr == deviceIp;
+          bool dstListMatch = dstList == addressListName;
+          bool actionMatch = action == 'drop';
+          bool chainMatch = chain == 'prerouting';
+          bool commentMatch = comment.contains('Facebook Filtering') || comment.contains('Block Facebook Traffic');
+          
+          if (srcAddrMatch || dstListMatch || commentMatch) {
+            matchingRawRulesCount++;
+            print('[Facebook Filter]   RAW Rule #$matchingRawRulesCount - ID: $ruleId');
+            print('[Facebook Filter]     src-address: "$srcAddr" (match: $srcAddrMatch, expected: $deviceIp)');
+            print('[Facebook Filter]     dst-address-list: "$dstList" (match: $dstListMatch, expected: $addressListName)');
+            print('[Facebook Filter]     action: "$action" (match: $actionMatch, expected: drop)');
+            print('[Facebook Filter]     chain: "$chain" (match: $chainMatch, expected: prerouting)');
+            print('[Facebook Filter]     comment: "$comment" (match: $commentMatch)');
+            print('[Facebook Filter]     disabled: $disabled');
+          }
+          
+          if (srcAddr == deviceIp && 
+              dstList == addressListName &&
+              action == 'drop' &&
+              chain == 'prerouting' &&
+              (comment.contains('Facebook Filtering') || comment.contains('Block Facebook Traffic'))) {
+            if (ruleId.isNotEmpty) {
+              rulesToRemove.add(ruleId);
+              print('[Facebook Filter]   ✓ Rule کامل مطابق پیدا شد و برای حذف علامت‌گذاری شد: $ruleId');
+            }
+          }
+        }
+        
+        print('[Facebook Filter] تعداد Rules با فیلدهای مشترک: $matchingRawRulesCount');
+        print('[Facebook Filter] تعداد Rules برای حذف: ${rulesToRemove.length}');
+        
+        // حذف همه rules قدیمی
+        for (final ruleId in rulesToRemove) {
+          try {
+            await _client!.talk([
+              '/ip/firewall/raw/remove',
+              '=.id=$ruleId',
+            ]);
+            print('[Facebook Filter]   ✓ RAW Rule قدیمی حذف شد: $ruleId');
+          } catch (e) {
+            print('[Facebook Filter]   ✗ خطا در حذف RAW Rule قدیمی $ruleId: $e');
+          }
+        }
+
+        // ایجاد RAW Rule جدید
+        print('[Facebook Filter]   → ایجاد RAW Rule جدید...');
+        final rawRuleParams = <String, String>{
+          'chain': 'prerouting',
+          'src-address': deviceIp,
+          'dst-address-list': addressListName,
+          'action': 'drop',
+          'comment': 'Facebook Filtering',
+          'disabled': 'no', // فعال
+        };
+
+        if (deviceMac != null && deviceMac.isNotEmpty) {
+          rawRuleParams['src-mac-address'] = deviceMac;
+          print('[Facebook Filter]   MAC Address اضافه شد: $deviceMac');
+        }
+
+        final rawCommand = <String>['/ip/firewall/raw/add'];
+        rawRuleParams.forEach((key, value) {
+          rawCommand.add('=$key=$value');
+        });
+
+        await _client!.talk(rawCommand);
+        print('[Facebook Filter]   ✓ RAW Rule جدید با موفقیت ایجاد شد');
+        print('[Facebook Filter] ========== پایان بررسی RAW Rules ==========');
+        
+        results['raw_rule'] = 'created';
+        results['old_rules_removed'] = rulesToRemove.length;
+      } catch (e) {
+        errors.add('خطا در ایجاد RAW Rule: $e');
+      }
+
+      return {
+        'success': errors.isEmpty,
+        'device_ip': deviceIp,
+        'address_list_name': addressListName,
+        'mangle_rules': mangleRulesCount,
+        'errors': errors,
+        'results': results,
+      };
+    } catch (e) {
+      throw Exception('خطا در فعال‌سازی فیلترینگ Facebook: $e');
+    }
+  }
+
+  /// غیرفعال‌سازی فیلترینگ Facebook برای یک دستگاه
+  /// کاملاً RAW Rule، Mangle Rules و Address List entries را حذف می‌کند
+  Future<bool> disableFacebookFilter(String deviceIp) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (deviceIp.isEmpty) {
+      throw Exception('آدرس IP دستگاه الزامی است');
+    }
+
+    try {
+      const addressListName = 'FaceBook';
+      int removedCount = 0;
+
+      // 1. حذف کامل RAW Rule مربوط به این دستگاه
+      try {
+        final allRawRules = await _client!.talk(['/ip/firewall/raw/print']);
+        for (final rule in allRawRules) {
+          final srcAddr = rule['src-address']?.toString() ?? '';
+          final dstList = rule['dst-address-list']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          
+          // بررسی اینکه آیا این rule مربوط به Facebook filtering این دستگاه است
+          if (srcAddr == deviceIp && 
+              dstList == addressListName &&
+              action == 'drop' &&
+              chain == 'prerouting' &&
+              (comment.contains('Facebook Filtering') || comment.contains('Block Facebook Traffic'))) {
+            final ruleId = rule['.id']?.toString();
+            if (ruleId != null) {
+              // حذف کامل rule (نه فقط disable)
+              await _client!.talk([
+                '/ip/firewall/raw/remove',
+                '=.id=$ruleId',
+              ]);
+              removedCount++;
+              print('[Facebook Filter] RAW Rule حذف شد برای $deviceIp: $ruleId');
+            }
+          }
+        }
+      } catch (e) {
+        print('[Facebook Filter] خطا در حذف RAW Rule: $e');
+      }
+
+      // 2. حذف Mangle Rules مربوط به Facebook detection
+      // بررسی دقیق بر اساس tls-host و سایر فیلدهای مهم (بدون توجه به addressList که ممکن است خالی باشد)
+      try {
+        print('[Facebook Filter] ========== شروع حذف Mangle Rules ==========');
+        final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
+        print('[Facebook Filter] تعداد کل Mangle Rules موجود: ${allMangleRules.length}');
+        
+        final facebookDomains = ['*.facebook.com', '*.fbcdn.net'];
+        int mangleRemovedCount = 0;
+        
+        for (final rule in allMangleRules) {
+          final tlsHost = rule['tls-host']?.toString() ?? '';
+          final action = rule['action']?.toString() ?? '';
+          final addressList = rule['dst-address-list']?.toString() ?? '';
+          final chain = rule['chain']?.toString() ?? '';
+          final protocol = rule['protocol']?.toString() ?? '';
+          final dstPort = rule['dst-port']?.toString() ?? '';
+          final ruleId = rule['.id']?.toString() ?? '';
+          final comment = rule['comment']?.toString() ?? '';
+          
+          // بررسی دقیق: اگر tls-host مربوط به Facebook است و سایر فیلدها مطابق هستند
+          // مهم: addressList ممکن است خالی باشد، پس آن را در شرط قرار نمی‌دهیم
+          // اما اگر addressList وجود دارد، باید FaceBook باشد
+          bool isFacebookRule = facebookDomains.contains(tlsHost) &&
+              action == 'add-dst-to-address-list' &&
+              chain == 'prerouting' &&
+              protocol == 'tcp' &&
+              dstPort == '443';
+          
+          // اگر addressList خالی نیست، باید FaceBook باشد
+          if (isFacebookRule && addressList.isNotEmpty && addressList != addressListName) {
+            isFacebookRule = false;
+          }
+          
+          // همچنین بررسی comment برای اطمینان بیشتر
+          if (isFacebookRule && comment.isNotEmpty) {
+            final commentLower = comment.toLowerCase();
+            if (commentLower.contains('facebook') || commentLower.contains('fbcdn')) {
+              isFacebookRule = true;
+            } else if (!commentLower.contains('detect')) {
+              // اگر comment دارد اما مربوط به Facebook نیست، احتمالاً rule دیگری است
+              isFacebookRule = false;
+            }
+          }
+          
+          if (isFacebookRule) {
+            print('[Facebook Filter]   Rule پیدا شد برای حذف - ID: $ruleId');
+            print('[Facebook Filter]     tls-host: "$tlsHost"');
+            print('[Facebook Filter]     action: "$action"');
+            print('[Facebook Filter]     dst-address-list: "$addressList"');
+            print('[Facebook Filter]     comment: "$comment"');
+            
+            if (ruleId.isNotEmpty) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/mangle/remove',
+                  '=.id=$ruleId',
+                ]);
+                mangleRemovedCount++;
+                removedCount++;
+                print('[Facebook Filter]   ✓ Mangle Rule حذف شد: $ruleId (tls-host: $tlsHost)');
+              } catch (e) {
+                print('[Facebook Filter]   ✗ خطا در حذف Mangle Rule $ruleId: $e');
+              }
+            }
+          }
+        }
+        
+        print('[Facebook Filter] تعداد Mangle Rules حذف شده: $mangleRemovedCount');
+        print('[Facebook Filter] ========== پایان حذف Mangle Rules ==========');
+      } catch (e) {
+        print('[Facebook Filter] خطا در حذف Mangle Rules: $e');
+      }
+
+      // 3. حذف Address List entries مربوط به Facebook
+      try {
+        final allAddressList = await _client!.talk(['/ip/firewall/address-list/print']);
+        int addressListRemoved = 0;
+        
+        for (final entry in allAddressList) {
+          final list = entry['list']?.toString() ?? '';
+          
+          // حذف همه entries در FaceBook address list
+          if (list == addressListName) {
+            final entryId = entry['.id']?.toString();
+            if (entryId != null) {
+              try {
+                await _client!.talk([
+                  '/ip/firewall/address-list/remove',
+                  '=.id=$entryId',
+                ]);
+                addressListRemoved++;
+              } catch (e) {
+                print('[Facebook Filter] خطا در حذف Address List entry $entryId: $e');
+              }
+            }
+          }
+        }
+        
+        if (addressListRemoved > 0) {
+          print('[Facebook Filter] $addressListRemoved Address List entries حذف شدند از $addressListName');
+        }
+      } catch (e) {
+        print('[Facebook Filter] خطا در حذف Address List entries: $e');
+      }
+
+      return removedCount > 0;
+    } catch (e) {
+      throw Exception('خطا در غیرفعال‌سازی فیلترینگ Facebook: $e');
+    }
+  }
+
 
   /// بررسی اینکه آیا comment شامل tag مربوط به پلتفرم است
   /// پشتیبانی از format های مختلف: Platform=, Platform-, Platforms=, Platforms-

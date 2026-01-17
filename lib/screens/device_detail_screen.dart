@@ -55,10 +55,14 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     _platformFilterStatus = {
       'telegram': false,
       'youtube': false,
+      'instagram': false,
+      'facebook': false,
     };
     _platformLoadingStatus = {
       'telegram': false,
       'youtube': false,
+      'instagram': false,
+      'facebook': false,
     };
     
     // فوراً از cache بارگذاری کن (اگر موجود است)
@@ -92,8 +96,6 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     _isLoadingStatus = false;
     _isLoadingStatic = false;
     _platformLoadingStatus.clear();
-    
-    print('[Device Detail] همه عملیات در حال اجرا لغو شد');
   }
 
   @override
@@ -119,10 +121,14 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
       _platformFilterStatus = {
         'telegram': false,
         'youtube': false,
+        'instagram': false,
+        'facebook': false,
       };
       _platformLoadingStatus = {
         'telegram': false,
         'youtube': false,
+        'instagram': false,
+        'facebook': false,
       };
       _loadAllData();
     } else {
@@ -182,9 +188,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
       });
       _pendingFutures.add(delayedFuture);
     } catch (e) {
-      if (!_isDisposed) {
-        print('[STATIC] _loadAllData: خطا در بارگذاری داده‌ها: $e');
-      }
+      // ignore errors
     } finally {
       if (mounted && !_isDisposed) {
         setState(() {
@@ -196,11 +200,13 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
 
   /// بارگذاری وضعیت فیلترینگ شبکه‌های اجتماعی
   Future<void> _loadPlatformFilterStatus({bool forceRefresh = false}) async {
-    if (_isDisposed || widget.device.ipAddress == null || widget.isBanned) {
+      if (_isDisposed || widget.device.ipAddress == null || widget.isBanned) {
       if (mounted && !_isDisposed) {
         setState(() {
           _platformFilterStatus['telegram'] = false;
           _platformFilterStatus['youtube'] = false;
+          _platformFilterStatus['instagram'] = false;
+          _platformFilterStatus['facebook'] = false;
         });
       }
       return;
@@ -232,19 +238,19 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
       final platforms = status['platforms'] as Map<String, dynamic>? ?? {};
       final newTelegramStatus = platforms['telegram'] == true;
       final newYoutubeStatus = platforms['youtube'] == true;
+      final newInstagramStatus = platforms['instagram'] == true;
+      final newFacebookStatus = platforms['facebook'] == true;
       
       if (mounted && !_isDisposed) {
         setState(() {
           _platformFilterStatus['telegram'] = newTelegramStatus;
           _platformFilterStatus['youtube'] = newYoutubeStatus;
+          _platformFilterStatus['instagram'] = newInstagramStatus;
+          _platformFilterStatus['facebook'] = newFacebookStatus;
         });
-        
-        print('[Platform Filter] وضعیت بارگذاری شد: telegram=$newTelegramStatus, youtube=$newYoutubeStatus (forceRefresh: $forceRefresh)');
       }
     } catch (e) {
       if (_isDisposed) return;
-      
-      print('[Platform Filter] خطا در بارگذاری وضعیت: $e');
       // در صورت خطا، سعی کن از cache استفاده کن (فقط اگر forceRefresh است)
       if (mounted && !_isDisposed && forceRefresh) {
         try {
@@ -258,13 +264,12 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
             setState(() {
               _platformFilterStatus['telegram'] = cachedPlatforms['telegram'] == true;
               _platformFilterStatus['youtube'] = cachedPlatforms['youtube'] == true;
+              _platformFilterStatus['instagram'] = cachedPlatforms['instagram'] == true;
+              _platformFilterStatus['facebook'] = cachedPlatforms['facebook'] == true;
             });
-            print('[Platform Filter] استفاده از cache بعد از خطا: telegram=${cachedPlatforms['telegram']}, youtube=${cachedPlatforms['youtube']}');
           }
         } catch (e2) {
-          if (!_isDisposed) {
-            print('[Platform Filter] خطا در بارگذاری از cache: $e2');
-          }
+          // ignore cache errors
         }
       }
     }
@@ -347,9 +352,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
         final refreshFuture = _loadPlatformFilterStatus(forceRefresh: true);
         _pendingFutures.add(refreshFuture);
         refreshFuture.catchError((error) {
-          if (!_isDisposed) {
-            print('[Platform Filter] خطا در به‌روزرسانی وضعیت: $error');
-          }
+          // ignore refresh errors
         });
       } else {
         setState(() {
@@ -1373,9 +1376,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
               final provider = Provider.of<ClientsProvider>(context, listen: false);
               provider.refresh();
             } catch (e) {
-              if (!_isDisposed) {
-                print('[Device Detail] خطا در تازه‌سازی داده‌های صفحه اصلی: $e');
-              }
+              // ignore refresh errors
             }
           });
         }
@@ -1672,6 +1673,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     final platforms = [
       {'key': 'telegram', 'name': 'تلگرام', 'icon': Icons.telegram, 'color': Colors.blue},
       {'key': 'youtube', 'name': 'یوتیوب', 'icon': Icons.play_circle, 'color': Colors.red},
+      {'key': 'instagram', 'name': 'اینستاگرام', 'icon': Icons.camera_alt, 'color': Color(0xFFE4405F)},
+      {'key': 'facebook', 'name': 'فیسبوک', 'icon': Icons.facebook, 'color': Color(0xFF1877F2)},
     ];
 
     return platforms.map((platform) {

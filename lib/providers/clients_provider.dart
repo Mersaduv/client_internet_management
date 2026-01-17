@@ -692,10 +692,10 @@ class ClientsProvider extends ChangeNotifier {
       final platformStatus = <String, bool>{
         'telegram': platforms['telegram'] == true,
         'facebook': platforms['facebook'] == true,
-        'instagram': platforms['instagram'] == true,
         'tiktok': platforms['tiktok'] == true,
         'whatsapp': platforms['whatsapp'] == true,
         'youtube': platforms['youtube'] == true,
+        'instagram': platforms['instagram'] == true,
       };
       _deviceFilterStatus[deviceIp] = platformStatus;
       print('[Filter Status] به‌روزرسانی cache برای $deviceIp: $platformStatus');
@@ -725,10 +725,10 @@ class ClientsProvider extends ChangeNotifier {
       final platformStatus = <String, bool>{
         'telegram': platforms['telegram'] == true,
         'facebook': platforms['facebook'] == true,
-        'instagram': platforms['instagram'] == true,
         'tiktok': platforms['tiktok'] == true,
         'whatsapp': platforms['whatsapp'] == true,
         'youtube': platforms['youtube'] == true,
+        'instagram': platforms['instagram'] == true,
       };
       
       // بررسی تغییرات با مقایسه عمیق
@@ -785,10 +785,10 @@ class ClientsProvider extends ChangeNotifier {
           _deviceFilterStatus[deviceIp] = {
             'telegram': false,
             'facebook': false,
-            'instagram': false,
             'tiktok': false,
             'whatsapp': false,
             'youtube': false,
+            'instagram': false,
           };
         }
         _deviceFilterStatus[deviceIp]![platform.toLowerCase()] = enable;
