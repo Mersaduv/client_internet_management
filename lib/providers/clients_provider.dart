@@ -17,8 +17,6 @@ class ClientsProvider extends ChangeNotifier {
   bool _isRefreshing = false;
   Map<String, dynamic>? _routerInfo;
   bool _isNewConnectionsLocked = false;
-  // Map برای ذخیره وضعیت Static دستگاه‌ها (key: IP یا MAC, value: bool)
-  final Map<String, bool> _deviceStaticStatus = {};
   // Map برای ذخیره وضعیت فیلترینگ شبکه‌های اجتماعی (key: deviceIp, value: Map<String, bool>)
   final Map<String, Map<String, bool>> _deviceFilterStatus = {};
 
@@ -231,7 +229,7 @@ class ClientsProvider extends ChangeNotifier {
             if (!isAllowed) {
               bool wasBanned = false;
               try {
-                // مسدود کردن دستگاه جدید یا دستگاه که دوباره وصل شده یا non-static
+                // مسدود کردن دستگاه جدید یا دستگاه که دوباره وصل شده
                 if (client.ipAddress != null) {
                   final banResult = await _serviceManager.service?.banClient(
                     client.ipAddress!,
@@ -334,9 +332,7 @@ class ClientsProvider extends ChangeNotifier {
       _isLoading = false;
       _errorMessage = null;
       
-      // به‌روزرسانی cache وضعیت Static برای دستگاه‌های متصل
       // این کار به صورت غیرهمزمان انجام می‌شود تا UI را block نکند
-      _updateStaticStatusCache(clientsList);
       
       notifyListeners();
     } catch (e) {
@@ -451,26 +447,78 @@ class ClientsProvider extends ChangeNotifier {
 
   /// تنظیم سرعت کلاینت و به‌روزرسانی state
   Future<bool> setClientSpeed(String target, String maxLimit) async {
+    print('═══════════════════════════════════════════════════════════');
+    print('📦 [PROVIDER_SET_SPEED] شروع تنظیم سرعت در Provider');
+    print('📦 [PROVIDER_SET_SPEED] Target: $target');
+    print('📦 [PROVIDER_SET_SPEED] Max Limit: $maxLimit');
+    
     if (!_serviceManager.isConnected) {
+      print('📦 [PROVIDER_SET_SPEED] ✗ اتصال برقرار نیست');
       _errorMessage = 'اتصال برقرار نشده است.';
       notifyListeners();
       return false;
     }
 
+    print('📦 [PROVIDER_SET_SPEED] ✓ اتصال برقرار است');
+    print('📦 [PROVIDER_SET_SPEED] در حال فراخوانی MikroTikService.setClientSpeed()...');
+
     try {
+      // افزایش timeout به 45 ثانیه برای اطمینان از تکمیل عملیات
       final success = await _serviceManager.service?.setClientSpeed(
         target,
         maxLimit,
+      ).timeout(
+        const Duration(seconds: 45),
+        onTimeout: () {
+          print('📦 [PROVIDER_SET_SPEED] ✗✗✗ Timeout در تنظیم سرعت (45 ثانیه) ✗✗✗');
+          _errorMessage = 'زمان تنظیم سرعت به پایان رسید. لطفاً دوباره تلاش کنید.';
+          notifyListeners();
+          return false;
+        },
       );
 
+      print('═══════════════════════════════════════════════════════════');
+      print('📦 [PROVIDER_SET_SPEED] نتیجه از MikroTikService: ${success == true ? "✓✓✓ موفق" : "✗✗✗ ناموفق"}');
+
       if (success == true) {
-        // به‌روزرسانی فوری state
-        await refresh();
+        print('📦 [PROVIDER_SET_SPEED] ✓✓✓ تنظیم سرعت با موفقیت کامل شد');
+        print('📦 [PROVIDER_SET_SPEED] به‌روزرسانی state در پس‌زمینه انجام می‌شود...');
+        print('═══════════════════════════════════════════════════════════');
+        
+        // به‌روزرسانی state در پس‌زمینه (بدون انتظار)
+        refresh().catchError((e) {
+          print('⚠️ [PROVIDER_SET_SPEED] خطا در refresh: $e');
+        });
+        
         return true;
       }
+      
+      print('📦 [PROVIDER_SET_SPEED] ✗ تنظیم سرعت ناموفق بود (success = false)');
+      _errorMessage = 'تنظیم سرعت ناموفق بود. لطفاً دوباره تلاش کنید.';
+      notifyListeners();
+      print('═══════════════════════════════════════════════════════════');
       return false;
-    } catch (e) {
-      _errorMessage = 'خطا در تنظیم سرعت: $e';
+    } catch (e, stackTrace) {
+      print('═══════════════════════════════════════════════════════════');
+      print('📦 [PROVIDER_SET_SPEED] ✗✗✗✗✗ خطای استثنا در تنظیم سرعت ✗✗✗✗✗');
+      print('📦 [PROVIDER_SET_SPEED] خطا: $e');
+      print('📦 [PROVIDER_SET_SPEED] نوع خطا: ${e.runtimeType}');
+      if (e is TimeoutException) {
+        print('📦 [PROVIDER_SET_SPEED] این یک TimeoutException است');
+      }
+      print('📦 [PROVIDER_SET_SPEED] Stack trace: $stackTrace');
+      print('═══════════════════════════════════════════════════════════');
+      
+      String errorMsg = 'خطا در تنظیم سرعت';
+      if (e is TimeoutException) {
+        errorMsg = 'زمان تنظیم سرعت به پایان رسید. لطفاً دوباره تلاش کنید.';
+      } else if (e.toString().contains('اتصال')) {
+        errorMsg = 'اتصال به روتر برقرار نیست. لطفاً اتصال را بررسی کنید.';
+      } else {
+        errorMsg = 'خطا در تنظیم سرعت: ${e.toString()}';
+      }
+      
+      _errorMessage = errorMsg;
       notifyListeners();
       return false;
     }
@@ -488,7 +536,6 @@ class ClientsProvider extends ChangeNotifier {
     _isRefreshing = false;
     _routerInfo = null;
     _isNewConnectionsLocked = false;
-    _deviceStaticStatus.clear(); // پاک کردن cache وضعیت Static
     _deviceFilterStatus.clear(); // پاک کردن cache وضعیت فیلترینگ
     notifyListeners();
   }
@@ -756,6 +803,176 @@ class ClientsProvider extends ChangeNotifier {
     }
   }
 
+  /// تبدیل Dynamic DHCP Lease به Static Lease
+  Future<Map<String, dynamic>> makeStaticLease({
+    required String? macAddress,
+    required String? ipAddress,
+    String? hostname,
+    String? comment,
+  }) async {
+    print('═══════════════════════════════════════════════════════════');
+    print('📱 [PROVIDER_STATIC] شروع فرآیند Static در Provider');
+    print('📱 [PROVIDER_STATIC] MAC: ${macAddress ?? "N/A"}');
+    print('📱 [PROVIDER_STATIC] IP: ${ipAddress ?? "N/A"}');
+    print('📱 [PROVIDER_STATIC] Hostname: ${hostname ?? "N/A"}');
+    print('📱 [PROVIDER_STATIC] Comment: ${comment ?? "N/A"}');
+    
+    if (!_serviceManager.isConnected) {
+      print('❌ [PROVIDER_STATIC] خطا: اتصال برقرار نشده');
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return {'success': false, 'error': _errorMessage};
+    }
+
+    print('✅ [PROVIDER_STATIC] اتصال برقرار است');
+    print('📞 [PROVIDER_STATIC] فراخوانی MikroTikServiceManager.makeStaticLease()...');
+
+    try {
+      final result = await _serviceManager.makeStaticLease(
+        macAddress: macAddress,
+        ipAddress: ipAddress,
+        hostname: hostname,
+        comment: comment,
+      ).timeout(
+        const Duration(seconds: 60),
+        onTimeout: () {
+          print('❌ [PROVIDER_STATIC] Timeout در فراخوانی Service Manager (60 ثانیه)');
+          return {
+            'status': 'error',
+            'message': 'Timeout: زمان تبدیل به Static Lease به پایان رسید. لطفاً دوباره تلاش کنید.',
+          };
+        },
+      );
+
+      print('📥 [PROVIDER_STATIC] نتیجه از Service Manager دریافت شد');
+      print('   Status: ${result['status']}');
+      print('   Message: ${result['message']}');
+
+      if (result['status'] == 'success' || result['status'] == 'info') {
+        print('✅ [PROVIDER_STATIC] تبدیل موفق - به‌روزرسانی state...');
+        // به‌روزرسانی فوری state
+        await refresh();
+        print('✅ [PROVIDER_STATIC] State به‌روزرسانی شد');
+        print('═══════════════════════════════════════════════════════════');
+        return {
+          'success': true,
+          'message': result['message'],
+          'lease': result['lease'],
+        };
+      }
+      
+      // Handle error or timeout status
+      print('❌ [PROVIDER_STATIC] تبدیل ناموفق');
+      print('   Status: ${result['status']}');
+      print('   Message: ${result['message']}');
+      print('═══════════════════════════════════════════════════════════');
+      return {
+        'success': false,
+        'error': result['message'] ?? 'خطای نامشخص',
+      };
+    } catch (e, stackTrace) {
+      print('❌ [PROVIDER_STATIC] خطای استثنا: $e');
+      print('   Type: ${e.runtimeType}');
+      print('   Stack: $stackTrace');
+      print('═══════════════════════════════════════════════════════════');
+      _errorMessage = 'خطا در تبدیل به Static Lease: $e';
+      notifyListeners();
+      return {'success': false, 'error': _errorMessage};
+    }
+  }
+
+  /// دریافت وضعیت Lease (Static/Dynamic)
+  /// Returns: true = static, false = dynamic, null = not found
+  Future<bool?> getLeaseStatus({
+    String? macAddress,
+    String? ipAddress,
+  }) async {
+    if (!_serviceManager.isConnected) {
+      return null;
+    }
+
+    try {
+      final service = _serviceManager.service;
+      if (service == null) {
+        return null;
+      }
+      return await service.getLeaseStatus(
+        macAddress: macAddress,
+        ipAddress: ipAddress,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// تبدیل Static DHCP Lease به Dynamic Lease
+  Future<Map<String, dynamic>> makeDynamicLease({
+    required String? macAddress,
+    required String? ipAddress,
+  }) async {
+    print('═══════════════════════════════════════════════════════════');
+    print('📱 [PROVIDER_DYNAMIC] شروع فرآیند Dynamic در Provider');
+    print('📱 [PROVIDER_DYNAMIC] MAC: ${macAddress ?? "N/A"}');
+    print('📱 [PROVIDER_DYNAMIC] IP: ${ipAddress ?? "N/A"}');
+    
+    if (!_serviceManager.isConnected) {
+      print('❌ [PROVIDER_DYNAMIC] خطا: اتصال برقرار نشده');
+      _errorMessage = 'اتصال برقرار نشده است.';
+      notifyListeners();
+      return {'success': false, 'error': _errorMessage};
+    }
+
+    print('✅ [PROVIDER_DYNAMIC] اتصال برقرار است');
+    print('📞 [PROVIDER_DYNAMIC] فراخوانی MikroTikServiceManager.makeDynamicLease()...');
+
+    try {
+      final result = await _serviceManager.makeDynamicLease(
+        macAddress: macAddress,
+        ipAddress: ipAddress,
+      ).timeout(
+        const Duration(seconds: 30), // کاهش timeout از 60 به 30 ثانیه
+        onTimeout: () {
+          print('❌ [PROVIDER_DYNAMIC] Timeout در فراخوانی Service Manager (30 ثانیه)');
+          return {
+            'status': 'error',
+            'message': 'Timeout: زمان تبدیل به Dynamic Lease به پایان رسید. لطفاً دوباره تلاش کنید.',
+          };
+        },
+      );
+
+      print('📥 [PROVIDER_DYNAMIC] نتیجه از Service Manager دریافت شد');
+      print('   Status: ${result['status']}');
+      print('   Message: ${result['message']}');
+
+      if (result['status'] == 'success' || result['status'] == 'info') {
+        print('✅ [PROVIDER_DYNAMIC] تبدیل موفق - به‌روزرسانی state...');
+        await refresh();
+        print('✅ [PROVIDER_DYNAMIC] State به‌روزرسانی شد');
+        print('═══════════════════════════════════════════════════════════');
+        return {
+          'success': true,
+          'message': result['message'],
+          'lease': result['lease'],
+        };
+      }
+      
+      print('❌ [PROVIDER_DYNAMIC] تبدیل ناموفق');
+      print('═══════════════════════════════════════════════════════════');
+      return {
+        'success': false,
+        'error': result['message'] ?? 'خطای نامشخص',
+      };
+    } catch (e, stackTrace) {
+      print('❌ [PROVIDER_DYNAMIC] خطای استثنا: $e');
+      print('   Type: ${e.runtimeType}');
+      print('   Stack: $stackTrace');
+      print('═══════════════════════════════════════════════════════════');
+      _errorMessage = 'خطا در تبدیل به Dynamic Lease: $e';
+      notifyListeners();
+      return {'success': false, 'error': _errorMessage};
+    }
+  }
+
   /// فیلتر/رفع فیلتر یک پلتفرم خاص برای یک دستگاه
   Future<Map<String, dynamic>> togglePlatformFilter(
     String deviceIp,
@@ -814,160 +1031,6 @@ class ClientsProvider extends ChangeNotifier {
     }
   }
 
-  /// بررسی اینکه آیا دستگاه Static است یا نه
-  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress, {String? hostname}) async {
-    print('[STATIC] ClientsProvider.isDeviceStatic: شروع');
-    print('[STATIC] IP: $ipAddress, MAC: $macAddress, hostname: $hostname');
-    print('[STATIC] isConnected: ${_serviceManager.isConnected}');
-    
-    // ابتدا از cache بررسی کن
-    String? cacheKey;
-    if (ipAddress != null && ipAddress.isNotEmpty) {
-      cacheKey = 'ip:$ipAddress';
-      if (_deviceStaticStatus.containsKey(cacheKey)) {
-        final cached = _deviceStaticStatus[cacheKey]!;
-        print('[STATIC] ClientsProvider.isDeviceStatic: از cache: $cached (key: $cacheKey)');
-        return cached;
-      }
-    }
-    if (macAddress != null && macAddress.isNotEmpty) {
-      cacheKey = 'mac:${macAddress.toUpperCase()}';
-      if (_deviceStaticStatus.containsKey(cacheKey)) {
-        final cached = _deviceStaticStatus[cacheKey]!;
-        print('[STATIC] ClientsProvider.isDeviceStatic: از cache: $cached (key: $cacheKey)');
-        return cached;
-      }
-    }
-    // بررسی cache با hostname (برای حالتی که MAC تغییر کرده)
-    if (hostname != null && hostname.isNotEmpty) {
-      cacheKey = 'hostname:${hostname.toLowerCase().trim()}';
-      if (_deviceStaticStatus.containsKey(cacheKey)) {
-        final cached = _deviceStaticStatus[cacheKey]!;
-        print('[STATIC] ClientsProvider.isDeviceStatic: از cache: $cached (key: $cacheKey)');
-        return cached;
-      }
-    }
-    
-    if (!_serviceManager.isConnected) {
-      print('[STATIC] ClientsProvider.isDeviceStatic: اتصال برقرار نیست');
-      return false;
-    }
-
-    try {
-      print('[STATIC] ClientsProvider.isDeviceStatic: فراخوانی serviceManager.isDeviceStatic');
-      final result = await _serviceManager.isDeviceStatic(ipAddress, macAddress, hostname: hostname);
-      print('[STATIC] ClientsProvider.isDeviceStatic: نتیجه از سرور: $result');
-      
-      // ذخیره در cache
-      if (ipAddress != null && ipAddress.isNotEmpty) {
-        _deviceStaticStatus['ip:$ipAddress'] = result;
-        print('[STATIC] ClientsProvider.isDeviceStatic: ذخیره در cache: ip:$ipAddress = $result');
-      }
-      if (macAddress != null && macAddress.isNotEmpty) {
-        _deviceStaticStatus['mac:${macAddress.toUpperCase()}'] = result;
-        print('[STATIC] ClientsProvider.isDeviceStatic: ذخیره در cache: mac:${macAddress.toUpperCase()} = $result');
-      }
-      if (hostname != null && hostname.isNotEmpty) {
-        _deviceStaticStatus['hostname:${hostname.toLowerCase().trim()}'] = result;
-        print('[STATIC] ClientsProvider.isDeviceStatic: ذخیره در cache: hostname:${hostname.toLowerCase().trim()} = $result');
-      }
-      
-      return result;
-    } catch (e) {
-      print('[STATIC] ClientsProvider.isDeviceStatic: خطا: $e');
-      print('[STATIC] Stack trace: ${StackTrace.current}');
-      return false;
-    }
-  }
-
-  /// تبدیل دستگاه به Static یا غیر Static
-  Future<bool> setDeviceStaticStatus(
-    String ipAddress,
-    String? macAddress, {
-    String? hostname,
-    bool isStatic = true,
-  }) async {
-    print('[STATIC] ClientsProvider.setDeviceStaticStatus: شروع');
-    print('[STATIC] IP: $ipAddress, MAC: $macAddress, hostname: $hostname, isStatic: $isStatic');
-    print('[STATIC] isConnected: ${_serviceManager.isConnected}');
-    
-    if (!_serviceManager.isConnected) {
-      print('[STATIC] ClientsProvider.setDeviceStaticStatus: اتصال برقرار نیست');
-      _errorMessage = 'اتصال برقرار نشده است.';
-      notifyListeners();
-      return false;
-    }
-
-    try {
-      print('[STATIC] ClientsProvider.setDeviceStaticStatus: فراخوانی serviceManager.setDeviceStaticStatus');
-      final success = await _serviceManager.setDeviceStaticStatus(
-        ipAddress,
-        macAddress,
-        hostname: hostname,
-        isStatic: isStatic,
-      );
-
-      print('[STATIC] ClientsProvider.setDeviceStaticStatus: نتیجه: $success');
-
-      if (success) {
-        print('[STATIC] ClientsProvider.setDeviceStaticStatus: موفق بود، به‌روزرسانی cache');
-        
-        // به‌روزرسانی cache
-        _deviceStaticStatus['ip:$ipAddress'] = isStatic;
-        print('[STATIC] ClientsProvider.setDeviceStaticStatus: به‌روزرسانی cache: ip:$ipAddress = $isStatic');
-        if (macAddress != null && macAddress.isNotEmpty) {
-          _deviceStaticStatus['mac:${macAddress.toUpperCase()}'] = isStatic;
-          print('[STATIC] ClientsProvider.setDeviceStaticStatus: به‌روزرسانی cache: mac:${macAddress.toUpperCase()} = $isStatic');
-        }
-        
-        notifyListeners();
-        
-        print('[STATIC] ClientsProvider.setDeviceStaticStatus: refresh می‌کنم');
-        await refresh();
-        return true;
-      } else {
-        print('[STATIC] ClientsProvider.setDeviceStaticStatus: ناموفق بود');
-      }
-      return false;
-    } catch (e) {
-      print('[STATIC] ClientsProvider.setDeviceStaticStatus: خطا: $e');
-      print('[STATIC] Stack trace: ${StackTrace.current}');
-      _errorMessage = 'خطا در تغییر وضعیت Static: $e';
-      notifyListeners();
-      return false;
-    }
-  }
-
-  /// به‌روزرسانی cache وضعیت Static برای لیست دستگاه‌ها
-  /// این متد به صورت غیرهمزمان وضعیت Static را از سرور می‌گیرد و در cache ذخیره می‌کند
-  Future<void> _updateStaticStatusCache(List<ClientInfo> clients) async {
-    if (!_serviceManager.isConnected || clients.isEmpty) {
-      return;
-    }
-
-    // فقط برای دستگاه‌هایی که IP دارند
-    for (var client in clients) {
-      if (client.ipAddress != null && client.ipAddress!.isNotEmpty) {
-        final ip = client.ipAddress!;
-        final mac = client.macAddress;
-        
-        // اگر در cache نیست، از سرور بگیر
-        final cacheKey = 'ip:$ip';
-        if (!_deviceStaticStatus.containsKey(cacheKey)) {
-          try {
-            final isStatic = await _serviceManager.isDeviceStatic(ip, mac);
-            _deviceStaticStatus[cacheKey] = isStatic;
-            if (mac != null && mac.isNotEmpty) {
-              _deviceStaticStatus['mac:${mac.toUpperCase()}'] = isStatic;
-            }
-            print('[STATIC] ClientsProvider._updateStaticStatusCache: به‌روزرسانی cache برای $ip = $isStatic');
-          } catch (e) {
-            // ignore errors - cache optional است
-          }
-        }
-      }
-    }
-  }
 
   @override
   void dispose() {

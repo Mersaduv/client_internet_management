@@ -140,29 +140,35 @@ class MikroTikServiceManager {
     return await _service!.getAllowedIpsForLock();
   }
 
-  /// بررسی اینکه آیا دستگاه Static است یا نه
-  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress, {String? hostname}) async {
-    if (_service == null || !isConnected) {
-      return false;
-    }
-    return await _service!.isDeviceStatic(ipAddress, macAddress, hostname: hostname);
-  }
-
-  /// تبدیل دستگاه به Static یا غیر Static
-  Future<bool> setDeviceStaticStatus(
-    String ipAddress,
-    String? macAddress, {
+  /// تبدیل Dynamic DHCP Lease به Static Lease
+  Future<Map<String, dynamic>> makeStaticLease({
+    required String? macAddress,
+    required String? ipAddress,
     String? hostname,
-    bool isStatic = true,
+    String? comment,
   }) async {
     if (_service == null || !isConnected) {
       throw Exception('اتصال برقرار نشده');
     }
-    return await _service!.setDeviceStaticStatus(
-      ipAddress,
-      macAddress,
+    return await _service!.makeStaticLease(
+      macAddress: macAddress,
+      ipAddress: ipAddress,
       hostname: hostname,
-      isStatic: isStatic,
+      comment: comment,
+    );
+  }
+
+  /// تبدیل Static DHCP Lease به Dynamic Lease
+  Future<Map<String, dynamic>> makeDynamicLease({
+    required String? macAddress,
+    required String? ipAddress,
+  }) async {
+    if (_service == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+    return await _service!.makeDynamicLease(
+      macAddress: macAddress,
+      ipAddress: ipAddress,
     );
   }
 

@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/client_info.dart';
-import '../services/mikrotik_service_manager.dart';
 import '../providers/clients_provider.dart';
+import '../services/mikrotik_service_manager.dart';
 
 /// صفحه جزئیات دستگاه
 class DeviceDetailScreen extends StatefulWidget {
@@ -22,22 +24,25 @@ class DeviceDetailScreen extends StatefulWidget {
 }
 
 class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBindingObserver {
-  final MikroTikServiceManager _serviceManager = MikroTikServiceManager();
-  bool _isLoading = false; // برای سایر عملیات (سرعت، static، etc.)
-  String? _speedLimit;
+  // ignore: unused_field
+  bool _isLoading = false; // برای سایر عملیات (ban/unban/static)
   // Telegram 功能已禁用，以下字段保留用于将来的平台支持
   // ignore: unused_field
   Map<String, bool> _platformFilterStatus = {};
   // Map برای مدیریت loading state هر پلتفرم جداگانه
   Map<String, bool> _platformLoadingStatus = {};
   bool _isLoadingStatus = false; // برای جلوگیری از race condition
-  bool? _isStatic;
-  bool _isLoadingStatic = false;
   bool _hasLoadedOnce = false; // برای بررسی اینکه آیا یک بار بارگذاری شده است
   bool _isDialogOpen = false; // برای جلوگیری از بررسی وضعیت در حین نمایش Dialog
   
-  // برای ذخیره Future های در حال اجرا جهت cancel کردن
-  final List<Future> _pendingFutures = [];
+  // برای ذخیره سرعت تنظیم شده (برای نمایش سریع)
+  String? _currentSpeedLimit; // فرمت: "8M/7M"
+  bool _isLoadingSpeed = false; // برای بارگذاری سرعت از RouterOS
+  
+  // برای ذخیره وضعیت Static/Dynamic Lease
+  bool? _isStaticLease; // null = unknown, true = static, false = dynamic
+  bool _isLoadingLeaseStatus = false; // برای بارگذاری وضعیت lease
+  
   bool _isDisposed = false; // برای جلوگیری از setState بعد از dispose
 
   static const Color _primaryColor = Color(0xFF428B7C);
@@ -46,10 +51,16 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    
+    print('═══════════════════════════════════════════════════════════');
+    print('📱 [DEVICE_DETAIL] صفحه جزئیات دستگاه باز شد');
+    print('📱 [DEVICE_DETAIL] IP: ${widget.device.ipAddress}');
+    print('📱 [DEVICE_DETAIL] MAC: ${widget.device.macAddress}');
+    print('📱 [DEVICE_DETAIL] نام: ${widget.device.hostName ?? widget.device.name ?? "نامشخص"}');
+    print('📱 [DEVICE_DETAIL] مسدود شده: ${widget.isBanned}');
+    print('═══════════════════════════════════════════════════════════');
+    
     // Reset همه state ها برای اطمینان از بارگذاری مجدد
-    _isStatic = null;
-    _isLoadingStatic = false;
-    _speedLimit = null;
     _hasLoadedOnce = false;
     // Initialize platform filter status and loading status
     _platformFilterStatus = {
@@ -65,6 +76,12 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
       'facebook': false,
     };
     
+    // فوراً بارگذاری وضعیت Lease (Static/Dynamic) - اولویت اول
+    if (widget.device.ipAddress != null && !widget.isBanned) {
+      // فوراً شروع کن (بدون انتظار برای post frame callback)
+      _loadLeaseStatus();
+    }
+    
     // فوراً از cache بارگذاری کن (اگر موجود است)
     if (widget.device.ipAddress != null && !widget.isBanned) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -74,9 +91,23 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     }
     
     // بارگذاری اطلاعات به صورت غیرهمزمان و بدون blocking کردن UI
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      // سپس سایر داده‌ها را بارگذاری کن
       _loadAllData();
       _hasLoadedOnce = true;
+      
+      // بارگذاری سرعت از cache (سریع) و سپس از RouterOS (در پس‌زمینه)
+      if (widget.device.ipAddress != null && !widget.isBanned) {
+        // ابتدا از cache بارگذاری کن (سریع)
+        _loadSpeedLimitFromCache();
+        
+        // سپس از RouterOS بارگذاری کن (در پس‌زمینه، بدون blocking)
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted && !_isDisposed) {
+            _loadSpeedLimit();
+          }
+        });
+      }
     });
   }
 
@@ -90,11 +121,9 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
   /// لغو همه عملیات در حال اجرا
   void _cancelAllPendingOperations() {
     _isDisposed = true;
-    _pendingFutures.clear();
     
     _isLoading = false;
     _isLoadingStatus = false;
-    _isLoadingStatic = false;
     _platformLoadingStatus.clear();
   }
 
@@ -103,53 +132,52 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     super.didChangeAppLifecycleState(state);
     // وقتی اپلیکیشن از background به foreground برمی‌گردد، وضعیت را دوباره بررسی کن
     if (state == AppLifecycleState.resumed && _hasLoadedOnce && mounted) {
-      _checkStaticStatus();
+      // وضعیت را دوباره بررسی کن
     }
   }
 
   @override
   void didUpdateWidget(DeviceDetailScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // اگر دستگاه تغییر کرد یا IP/MAC تغییر کرد، داده‌ها را دوباره بارگذاری کن
-    if (oldWidget.device.ipAddress != widget.device.ipAddress ||
-        oldWidget.device.macAddress != widget.device.macAddress ||
-        oldWidget.isBanned != widget.isBanned) {
-      _isStatic = null;
-      _isLoadingStatic = false;
-      _speedLimit = null;
-      // Reset platform filter status and loading status
-      _platformFilterStatus = {
-        'telegram': false,
-        'youtube': false,
-        'instagram': false,
-        'facebook': false,
-      };
-      _platformLoadingStatus = {
-        'telegram': false,
-        'youtube': false,
-        'instagram': false,
-        'facebook': false,
-      };
-      _loadAllData();
-    } else {
-      // حتی اگر دستگاه تغییر نکرده باشد، وضعیت Static و Platform Filter را دوباره بررسی کن
-      // این برای اطمینان از به‌روز بودن وضعیت است
-      // اما فقط اگر Dialog باز نیست
-      if (widget.device.ipAddress != null && !widget.isBanned && !_isDialogOpen) {
-        _checkStaticStatus();
-        // فوراً از cache استفاده کن تا UI سریع به‌روزرسانی شود
-        // سپس در پس‌زمینه از سرور به‌روزرسانی کن
-        _loadPlatformFilterStatus(forceRefresh: false); // ابتدا از cache استفاده کن (سریع)
-        
-        // سپس در پس‌زمینه از سرور به‌روزرسانی کن (بدون blocking کردن UI)
-        final delayedFuture = Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted && !_isDisposed) {
-            _loadPlatformFilterStatus(forceRefresh: true);
-          }
-        });
-        _pendingFutures.add(delayedFuture);
+      // اگر دستگاه تغییر کرد یا IP/MAC تغییر کرد، داده‌ها را دوباره بارگذاری کن
+      if (        oldWidget.device.ipAddress != widget.device.ipAddress ||
+          oldWidget.device.macAddress != widget.device.macAddress ||
+          oldWidget.isBanned != widget.isBanned) {
+        // Reset speed limit (cache را نگه داریم، فقط state را reset کن)
+        _currentSpeedLimit = null;
+        // Reset platform filter status and loading status
+        _platformFilterStatus = {
+          'telegram': false,
+          'youtube': false,
+          'instagram': false,
+          'facebook': false,
+        };
+        _platformLoadingStatus = {
+          'telegram': false,
+          'youtube': false,
+          'instagram': false,
+          'facebook': false,
+        };
+        _loadAllData();
+      } else {
+        // حتی اگر دستگاه تغییر نکرده باشد، وضعیت Platform Filter و سرعت را دوباره بررسی کن
+        // این برای اطمینان از به‌روز بودن وضعیت است
+        // اما فقط اگر Dialog باز نیست
+        if (widget.device.ipAddress != null && !widget.isBanned && !_isDialogOpen) {
+          // بارگذاری سرعت از RouterOS
+          _loadSpeedLimit();
+          // فوراً از cache استفاده کن تا UI سریع به‌روزرسانی شود
+          // سپس در پس‌زمینه از سرور به‌روزرسانی کن
+          _loadPlatformFilterStatus(forceRefresh: false); // ابتدا از cache استفاده کن (سریع)
+          
+          // سپس در پس‌زمینه از سرور به‌روزرسانی کن (بدون blocking کردن UI)
+          Future.delayed(const Duration(milliseconds: 500), () {
+            if (mounted && !_isDisposed) {
+              _loadPlatformFilterStatus(forceRefresh: true);
+            }
+          });
+        }
       }
-    }
   }
 
   /// بارگذاری همه داده‌ها به صورت همزمان و صبر برای تمام شدن
@@ -157,15 +185,10 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     if (_isDisposed || _isLoadingStatus) return;
     _isLoadingStatus = true;
 
-    final loadAllFuture = _loadAllDataInternal();
-    _pendingFutures.add(loadAllFuture);
-    
     try {
-      await loadAllFuture;
+      await _loadAllDataInternal();
     } catch (e) {
-      if (!_isDisposed) {
-        print('[STATIC] _loadAllData: خطا در بارگذاری داده‌ها: $e');
-      }
+      // ignore errors
     }
   }
 
@@ -173,20 +196,16 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     if (_isDisposed) return;
 
     try {
-      await Future.wait([
-        _loadSpeedLimit(),
-        _checkStaticStatus(),
-        _loadPlatformFilterStatus(forceRefresh: false),
-      ]);
+      // بارگذاری داده‌ها
+      await _loadPlatformFilterStatus(forceRefresh: false);
       
       if (_isDisposed) return;
       
-      final delayedFuture = Future.delayed(const Duration(milliseconds: 500), () {
+      Future.delayed(const Duration(milliseconds: 500), () {
         if (mounted && !_isDisposed) {
           _loadPlatformFilterStatus(forceRefresh: true);
         }
       });
-      _pendingFutures.add(delayedFuture);
     } catch (e) {
       // ignore errors
     } finally {
@@ -212,14 +231,10 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
       return;
     }
 
-    final loadFuture = _loadPlatformFilterStatusInternal(forceRefresh);
-    _pendingFutures.add(loadFuture);
-    
     try {
-      await loadFuture;
+      await _loadPlatformFilterStatusInternal(forceRefresh);
     } catch (e) {
       if (!_isDisposed) {
-        print('[Platform Filter] خطا در بارگذاری وضعیت: $e');
       }
     }
   }
@@ -291,11 +306,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
       _platformFilterStatus[platform] = newStatus;
     });
 
-    final toggleFuture = _togglePlatformFilterInternal(platform, platformName, currentStatus, newStatus);
-    _pendingFutures.add(toggleFuture);
-    
     try {
-      await toggleFuture;
+      await _togglePlatformFilterInternal(platform, platformName, currentStatus, newStatus);
     } catch (e) {
       if (!_isDisposed && mounted) {
         setState(() {
@@ -349,10 +361,25 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
           ),
         );
         
-        final refreshFuture = _loadPlatformFilterStatus(forceRefresh: true);
-        _pendingFutures.add(refreshFuture);
-        refreshFuture.catchError((error) {
-          // ignore refresh errors
+        // تازه‌سازی کامل داده‌های صفحه و رندر مجدد
+        // ابتدا Provider را تازه‌سازی کن تا داده‌های کلی به‌روز شوند
+        try {
+          provider.refresh();
+        } catch (e) {
+          // ignore provider refresh errors
+        }
+        
+        // سپس وضعیت فیلتر را از سرور دریافت کن
+        _loadPlatformFilterStatus(forceRefresh: true).then((_) {
+          if (mounted && !_isDisposed) {
+            // رندر مجدد صفحه با داده‌های جدید
+            setState(() {});
+          }
+        }).catchError((error) {
+          // حتی اگر خطا رخ داد، سعی کن صفحه را رندر کن
+          if (mounted && !_isDisposed) {
+            setState(() {});
+          }
         });
       } else {
         setState(() {
@@ -376,6 +403,15 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
             behavior: SnackBarBehavior.floating,
           ),
         );
+        
+        // حتی در صورت خطا، وضعیت را از سرور دریافت کن تا مطمئن شویم
+        _loadPlatformFilterStatus(forceRefresh: true).then((_) {
+          if (mounted && !_isDisposed) {
+            setState(() {});
+          }
+        }).catchError((error) {
+          // ignore refresh errors
+        });
       }
     } catch (e) {
       if (_isDisposed || !mounted) return;
@@ -397,354 +433,53 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
           behavior: SnackBarBehavior.floating,
         ),
       );
-    }
-  }
-
-  Future<void> _loadSpeedLimit() async {
-    if (_isDisposed || widget.device.ipAddress == null || widget.isBanned) {
-      return;
-    }
-
-    try {
-      final service = _serviceManager.service;
-      if (service == null || !_serviceManager.isConnected) {
+      
+      // حتی در صورت خطا، وضعیت را از سرور دریافت کن تا مطمئن شویم
+      _loadPlatformFilterStatus(forceRefresh: true).then((_) {
         if (mounted && !_isDisposed) {
-          setState(() {
-            _speedLimit = 'N/A';
-          });
+          setState(() {});
         }
-        return;
-      }
-
-      final queues = await service.getClientSpeed(widget.device.ipAddress!).timeout(
-        const Duration(seconds: 5),
-        onTimeout: () => null,
-      );
-      
-      if (_isDisposed || !mounted) return;
-      
-      setState(() {
-        _speedLimit = queues?['max_limit'] ?? 'N/A';
+      }).catchError((error) {
+        // ignore refresh errors
       });
-    } catch (e) {
-      if (_isDisposed || !mounted) return;
-      
-      setState(() {
-        _speedLimit = 'N/A';
-      });
-    }
-  }
-
-  Future<void> _checkStaticStatus() async {
-    if (_isDisposed || _isDialogOpen) {
-      return;
-    }
-    
-    if (widget.device.ipAddress == null || widget.isBanned) {
-      if (mounted && !_isDisposed) {
-        setState(() {
-          _isStatic = null;
-          _isLoadingStatic = false;
-        });
-      }
-      return;
-    }
-
-    if (_isLoadingStatic) {
-      await Future.delayed(const Duration(milliseconds: 100));
-      if (_isDisposed || _isLoadingStatic) {
-        return;
-      }
-    }
-
-    _isLoadingStatic = true;
-    final checkFuture = _checkStaticStatusInternal();
-    _pendingFutures.add(checkFuture);
-    
-    try {
-      await checkFuture;
-    } catch (e) {
-      if (!_isDisposed && mounted) {
-        setState(() {
-          _isStatic = null;
-          _isLoadingStatic = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _checkStaticStatusInternal() async {
-    if (_isDisposed) return;
-
-    try {
-      final provider = Provider.of<ClientsProvider>(context, listen: false);
-      final isStatic = await provider.isDeviceStatic(
-        widget.device.ipAddress,
-        widget.device.macAddress,
-        hostname: widget.device.hostName ?? widget.device.name,
-      );
-      
-      if (_isDisposed || !mounted) return;
-      
-      setState(() {
-        _isStatic = isStatic;
-        _isLoadingStatic = false;
-      });
-    } catch (e) {
-      if (_isDisposed || !mounted) return;
-      
-      setState(() {
-        _isStatic = null;
-        _isLoadingStatic = false;
-      });
-    }
-  }
-
-  Future<void> _toggleStaticStatus() async {
-    if (_isDisposed || widget.device.ipAddress == null || widget.isBanned || _isLoading) {
-      return;
-    }
-
-    if (_isDisposed || !mounted) return;
-    
-    final isCurrentlyStatic = _isStatic == true;
-    
-    setState(() {
-      _isDialogOpen = true;
-    });
-
-    final actionText = isCurrentlyStatic ? 'تبدیل به غیر Static' : 'تبدیل به Static';
-    final message = isCurrentlyStatic
-        ? 'آیا مطمئن هستید که می‌خواهید دستگاه ${widget.device.ipAddress} را به غیر Static تبدیل کنید؟\n\n'
-            'بعد از تبدیل به غیر Static:\n'
-            '• IP دستگاه ممکن است تغییر کند\n'
-            '• دستگاه به صورت Dynamic شناسایی می‌شود'
-        : 'آیا مطمئن هستید که می‌خواهید دستگاه ${widget.device.ipAddress} را به Static تبدیل کنید؟\n\n'
-            'بعد از تبدیل به Static:\n'
-            '• IP دستگاه ثابت می‌ماند\n'
-            '• MAC Address ثابت می‌ماند\n'
-            '• دستگاه همیشه با همان IP شناسایی می‌شود';
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(actionText),
-        content: Text(message),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('لغو'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: isCurrentlyStatic ? Colors.orange : _primaryColor,
-              foregroundColor: Colors.white,
-            ),
-            child: Text(actionText),
-          ),
-        ],
-      ),
-    );
-
-    if (mounted && !_isDisposed) {
-      setState(() {
-        _isDialogOpen = false;
-      });
-    }
-
-    if (confirmed == true && !_isDisposed) {
-      if (!mounted) return;
-      
-      setState(() {
-        _isLoading = true;
-        _isDialogOpen = true;
-      });
-
-      final toggleFuture = _toggleStaticStatusInternal(isCurrentlyStatic);
-      _pendingFutures.add(toggleFuture);
-      
-      try {
-        await toggleFuture;
-      } catch (e) {
-        if (!_isDisposed && mounted) {
-          setState(() {
-            _isLoading = false;
-            _isDialogOpen = false;
-          });
-        }
-      }
-    }
-  }
-
-  Future<void> _toggleStaticStatusInternal(bool isCurrentlyStatic) async {
-    if (_isDisposed) return;
-
-    try {
-      final provider = Provider.of<ClientsProvider>(context, listen: false);
-      final success = await provider.setDeviceStaticStatus(
-        widget.device.ipAddress!,
-        widget.device.macAddress,
-        hostname: widget.device.hostName ?? widget.device.name,
-        isStatic: !isCurrentlyStatic,
-      );
-
-      if (_isDisposed || !mounted) return;
-
-      if (success) {
-        setState(() {
-          _isStatic = !isCurrentlyStatic;
-        });
-        
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.check_circle, color: Colors.white),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    isCurrentlyStatic
-                        ? 'دستگاه با موفقیت به غیر Static تبدیل شد'
-                        : 'دستگاه با موفقیت به Static تبدیل شد',
-                  ),
-                ),
-              ],
-            ),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-        
-        await Future.delayed(const Duration(milliseconds: 1000));
-        
-        if (_isDisposed || !mounted) return;
-        
-        setState(() {
-          _isDialogOpen = false;
-        });
-        
-        final checkFuture = _checkStaticStatus();
-        _pendingFutures.add(checkFuture);
-        await checkFuture;
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.error, color: Colors.white),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'خطا: ${provider.errorMessage ?? "خطا در تغییر وضعیت Static"}',
-                  ),
-                ),
-              ],
-            ),
-            backgroundColor: Colors.red,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
-    } catch (e) {
-      if (_isDisposed || !mounted) return;
-      
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Row(
-            children: [
-              const Icon(Icons.error, color: Colors.white),
-              const SizedBox(width: 8),
-              Expanded(child: Text('خطا: $e')),
-            ],
-          ),
-          backgroundColor: Colors.red,
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    } finally {
-      if (mounted && !_isDisposed) {
-        setState(() {
-          _isLoading = false;
-          _isDialogOpen = false;
-        });
-      }
     }
   }
 
   Future<void> _setSpeedLimit() async {
     if (_isDisposed || widget.device.ipAddress == null) return;
 
-    // ابتدا سرعت فعلی را از Simple Queues دریافت کن
-    String? currentSpeedLimit;
-    try {
-      // دریافت لیست Simple Queues و پیدا کردن queue مربوط به این دستگاه
-      final service = _serviceManager.service;
-      if (service != null && _serviceManager.isConnected) {
-        final speed = await service.getClientSpeed(widget.device.ipAddress!);
-        currentSpeedLimit = speed?['max_limit'];
-        
-        // اگر با IP پیدا نشد، با MAC address امتحان کن
-        if ((currentSpeedLimit == null || currentSpeedLimit == 'N/A') && widget.device.macAddress != null) {
-          final speedByMac = await service.getClientSpeed(widget.device.macAddress!);
-          currentSpeedLimit = speedByMac?['max_limit'];
-        }
-      }
-    } catch (e) {
-      // اگر خطا رخ داد، از مقدار قبلی استفاده کن
-      if (_speedLimit != null && _speedLimit != 'N/A') {
-        currentSpeedLimit = _speedLimit;
-      }
-    }
-
-    // استخراج سرعت فعلی برای نمایش در فیلدها
-    String currentDownloadValue = '';
-    String currentUploadValue = '';
-    String currentDownloadUnit = 'M';
-    String currentUploadUnit = 'M';
+    // اگر سرعت قبلاً تنظیم شده، آن را از state بگیر و به فرمت قابل نمایش تبدیل کن
+    String? currentDownloadValue;
+    String? currentUploadValue;
+    String selectedDownloadUnit = 'M';
+    String selectedUploadUnit = 'M';
     
-    if (currentSpeedLimit != null && currentSpeedLimit != 'N/A' && currentSpeedLimit.isNotEmpty) {
-      // فرمت MikroTik: upload/download (مثال: 10M/10M)
-      final parts = currentSpeedLimit.split('/');
+    if (_currentSpeedLimit != null) {
+      // فرمت: "8M/7M" -> download: 8M, upload: 7M
+      final parts = _currentSpeedLimit!.split('/');
       if (parts.length == 2) {
-        final uploadPart = parts[0].trim();
-        final downloadPart = parts[1].trim();
+        final uploadPart = parts[0].trim(); // 8M
+        final downloadPart = parts[1].trim(); // 7M
         
-        // استخراج عدد و واحد از آپلود
+        // استخراج عدد و واحد
         final uploadMatch = RegExp(r'^(\d+)([KMkm]?)$').firstMatch(uploadPart);
         if (uploadMatch != null) {
-          currentUploadValue = uploadMatch.group(1) ?? '';
-          final unit = uploadMatch.group(2) ?? '';
-          currentUploadUnit = unit.isEmpty ? 'M' : unit.toUpperCase();
+          currentUploadValue = uploadMatch.group(1);
+          selectedUploadUnit = (uploadMatch.group(2) ?? 'M').toUpperCase();
         }
         
-        // استخراج عدد و واحد از دانلود
         final downloadMatch = RegExp(r'^(\d+)([KMkm]?)$').firstMatch(downloadPart);
         if (downloadMatch != null) {
-          currentDownloadValue = downloadMatch.group(1) ?? '';
-          final unit = downloadMatch.group(2) ?? '';
-          currentDownloadUnit = unit.isEmpty ? 'M' : unit.toUpperCase();
-        }
-      } else if (parts.length == 1) {
-        // اگر فقط یک مقدار وجود دارد (فرمت قدیمی)
-        final singleMatch = RegExp(r'^(\d+)([KMkm]?)$').firstMatch(parts[0].trim());
-        if (singleMatch != null) {
-          final value = singleMatch.group(1) ?? '';
-          final unit = singleMatch.group(2) ?? '';
-          final unitUpper = unit.isEmpty ? 'M' : unit.toUpperCase();
-          currentDownloadValue = value;
-          currentUploadValue = value;
-          currentDownloadUnit = unitUpper;
-          currentUploadUnit = unitUpper;
+          currentDownloadValue = downloadMatch.group(1);
+          selectedDownloadUnit = (downloadMatch.group(2) ?? 'M').toUpperCase();
         }
       }
     }
-
-    final downloadValueController = TextEditingController(text: currentDownloadValue);
-    final uploadValueController = TextEditingController(text: currentUploadValue);
-    String selectedDownloadUnit = currentDownloadUnit;
-    String selectedUploadUnit = currentUploadUnit;
+    
+    final downloadValueController = TextEditingController(text: currentDownloadValue ?? '');
+    final uploadValueController = TextEditingController(text: currentUploadValue ?? '');
     final formKey = GlobalKey<FormState>();
+    bool isSaving = false;
 
     final result = await showDialog<Map<String, String>>(
       context: context,
@@ -776,7 +511,6 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                           ),
                         ),
                       ),
-
                     ],
                   ),
                   const SizedBox(height: 32),
@@ -1011,7 +745,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
                       TextButton(
-                        onPressed: () => Navigator.pop(context),
+                        onPressed: isSaving ? null : () => Navigator.pop(context),
                         style: TextButton.styleFrom(
                           padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 14),
                           minimumSize: const Size(100, 48),
@@ -1023,8 +757,12 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                       ),
                       const SizedBox(width: 12),
                       ElevatedButton.icon(
-                        onPressed: () {
+                        onPressed: isSaving ? null : () async {
                           if (formKey.currentState!.validate()) {
+                            setDialogState(() {
+                              isSaving = true;
+                            });
+                            
                             final downloadValue = downloadValueController.text.trim();
                             final uploadValue = uploadValueController.text.trim();
                             
@@ -1034,8 +772,17 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                             });
                           }
                         },
-                        icon: const Icon(Icons.save),
-                        label: const Text('ذخیره'),
+                        icon: isSaving 
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                              ),
+                            )
+                          : const Icon(Icons.save),
+                        label: Text(isSaving ? 'در حال ذخیره...' : 'ذخیره'),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: _primaryColor,
                           foregroundColor: Colors.white,
@@ -1056,41 +803,58 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
       ),
     );
 
-    if (result != null && !_isDisposed) {
-      if (!mounted) return;
+    // اگر کاربر داده‌ها را وارد کرد، سرعت را تنظیم کن
+    if (result != null && !_isDisposed && mounted) {
+      final download = result['download'] ?? '';
+      final upload = result['upload'] ?? '';
       
-      setState(() {
-        _isLoading = true;
-      });
+      if (download.isNotEmpty && upload.isNotEmpty) {
+        // فرمت: 4M/12M (آپلود/دانلود)
+        final maxLimit = '$upload/$download';
+        
+        setState(() {
+          _isLoading = true;
+        });
 
-      final setSpeedFuture = _setSpeedLimitInternal(result);
-      _pendingFutures.add(setSpeedFuture);
-      
-      try {
-        await setSpeedFuture;
-      } catch (e) {
-        if (!_isDisposed && mounted) {
-          setState(() {
-            _isLoading = false;
-          });
+        try {
+          await _setSpeedLimitInternal(widget.device.ipAddress!, maxLimit);
+        } catch (e) {
+          if (!_isDisposed && mounted) {
+            setState(() {
+              _isLoading = false;
+            });
+          }
         }
       }
     }
   }
 
-  Future<void> _setSpeedLimitInternal(Map<String, String> result) async {
-    if (_isDisposed) return;
-
+  Future<void> _setSpeedLimitInternal(String ipAddress, String maxLimit) async {
+    // برای عملیات مهم مانند تنظیم سرعت، حتی اگر dispose شده باشیم،
+    // باید عملیات را کامل کنیم (اما UI feedback را فقط اگر mounted باشیم نشان می‌دهیم)
     try {
-      final speedLimit = '${result['upload']}/${result['download']}';
       final provider = Provider.of<ClientsProvider>(context, listen: false);
       final success = await provider.setClientSpeed(
-        widget.device.ipAddress!,
-        speedLimit,
+        ipAddress,
+        maxLimit,
+      ).timeout(
+        const Duration(seconds: 45), // افزایش timeout به 45 ثانیه
+        onTimeout: () {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('زمان تنظیم سرعت به پایان رسید'),
+                backgroundColor: Colors.orange,
+              ),
+            );
+          }
+          return false;
+        },
       );
-      
-      if (_isDisposed || !mounted) return;
-      
+
+      // فقط اگر mounted باشیم، UI را به‌روزرسانی می‌کنیم
+      if (!mounted) return;
+
       if (success) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -1099,9 +863,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                 const Icon(Icons.check_circle, color: Colors.white),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Text(
-                    'سرعت تنظیم شد: دانلود ${result['download']} - آپلود ${result['upload']}',
-                  ),
+                  child: Text('سرعت با موفقیت تنظیم شد: $maxLimit'),
                 ),
               ],
             ),
@@ -1110,9 +872,27 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
           ),
         );
         
-        final loadFuture = _loadSpeedLimit();
-        _pendingFutures.add(loadFuture);
-        await loadFuture;
+        // فوراً سرعت را در state ذخیره کن (برای نمایش سریع)
+        setState(() {
+          _currentSpeedLimit = maxLimit;
+        });
+        
+        // ذخیره در cache برای بارگذاری بعدی
+        _saveSpeedLimitToCache(maxLimit);
+        
+        // تازه‌سازی داده‌ها در پس‌زمینه
+        try {
+          provider.refresh();
+          // در پس‌زمینه از RouterOS بارگذاری کن (برای تأیید)
+          // 延迟一点时间，让 RouterOS 有时间创建 queue
+          Future.delayed(const Duration(seconds: 2), () {
+            if (mounted && !_isDisposed) {
+              _loadSpeedLimit();
+            }
+          });
+        } catch (e) {
+          // ignore refresh errors
+        }
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -1121,9 +901,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                 const Icon(Icons.error, color: Colors.white),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Text(
-                    'خطا: ${provider.errorMessage ?? "خطا در تنظیم سرعت"}',
-                  ),
+                  child: Text('خطا: ${provider.errorMessage ?? "خطا در تنظیم سرعت"}'),
                 ),
               ],
             ),
@@ -1131,12 +909,10 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
             behavior: SnackBarBehavior.floating,
           ),
         );
-        setState(() {
-          _isLoading = false;
-        });
       }
     } catch (e) {
-      if (_isDisposed || !mounted) return;
+      // فقط اگر mounted باشیم، خطا را نمایش می‌دهیم
+      if (!mounted) return;
       
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1151,9 +927,155 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
           behavior: SnackBarBehavior.floating,
         ),
       );
-      setState(() {
-        _isLoading = false;
-      });
+    } finally {
+      // فقط اگر mounted باشیم، loading state را به‌روزرسانی می‌کنیم
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  /// بارگذاری سرعت از cache (SharedPreferences)
+  Future<void> _loadSpeedLimitFromCache() async {
+    if (_isDisposed || widget.device.ipAddress == null) return;
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cacheKey = 'speed_limit_${widget.device.ipAddress}';
+      final cachedSpeed = prefs.getString(cacheKey);
+      
+      if (cachedSpeed != null && cachedSpeed.isNotEmpty) {
+        // 检查 cache 中的值是否有效（排除 "0K/0K" 或类似的值）
+        final isValid = _isValidSpeedLimit(cachedSpeed);
+        if (isValid) {
+          print('✅ [LOAD_SPEED_CACHE] سرعت از cache بارگذاری شد: $cachedSpeed');
+          if (mounted && !_isDisposed) {
+            setState(() {
+              _currentSpeedLimit = cachedSpeed;
+            });
+          }
+        } else {
+          print('⚠️ [LOAD_SPEED_CACHE] مقدار cache نامعتبر است (نادیده گرفته شد): $cachedSpeed');
+          // 清除无效的 cache
+          await prefs.remove(cacheKey);
+        }
+      }
+    } catch (e) {
+      print('⚠️ [LOAD_SPEED_CACHE] خطا در بارگذاری از cache: $e');
+      // ignore errors
+    }
+  }
+
+  /// بررسی اینکه سرعت معتبر است یا نه (مثلاً "0K/0K" نامعتبر است)
+  bool _isValidSpeedLimit(String speedLimit) {
+    if (speedLimit.isEmpty) return false;
+    
+    // 检查是否是 "0K/0K" 或类似的值
+    if (speedLimit.toLowerCase().contains('0k/0k') || 
+        speedLimit.toLowerCase().contains('0m/0m') ||
+        speedLimit == '0/0') {
+      return false;
+    }
+    
+    // 检查格式是否正确 (应该包含 "/")
+    if (!speedLimit.contains('/')) {
+      return false;
+    }
+    
+    return true;
+  }
+
+  /// ذخیره سرعت در cache (SharedPreferences)
+  Future<void> _saveSpeedLimitToCache(String speedLimit) async {
+    if (widget.device.ipAddress == null) return;
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cacheKey = 'speed_limit_${widget.device.ipAddress}';
+      await prefs.setString(cacheKey, speedLimit);
+      print('✅ [SAVE_SPEED_CACHE] سرعت در cache ذخیره شد: $speedLimit');
+    } catch (e) {
+      print('⚠️ [SAVE_SPEED_CACHE] خطا در ذخیره cache: $e');
+      // ignore errors
+    }
+  }
+
+  /// بارگذاری سرعت از RouterOS (در پس‌زمینه)
+  Future<void> _loadSpeedLimit() async {
+    if (_isDisposed || widget.device.ipAddress == null || widget.isBanned) {
+      return;
+    }
+
+    if (_isLoadingSpeed) return; // جلوگیری از بارگذاری همزمان
+    _isLoadingSpeed = true;
+
+    try {
+      // استفاده از MikroTikServiceManager برای دسترسی مستقیم
+      final serviceManager = MikroTikServiceManager();
+      if (serviceManager.service == null || !serviceManager.isConnected) {
+        return;
+      }
+      
+      // 增加 timeout 并添加日志
+      print('🔧 [LOAD_SPEED] در حال بارگذاری سرعت برای IP: ${widget.device.ipAddress}');
+      final speedInfo = await serviceManager.service!.getClientSpeed(widget.device.ipAddress!)
+          .timeout(const Duration(seconds: 15), onTimeout: () {
+            print('⚠️ [LOAD_SPEED] Timeout در بارگذاری سرعت برای IP: ${widget.device.ipAddress}');
+            return null;
+          });
+
+      if (_isDisposed || !mounted) return;
+
+      if (speedInfo != null && speedInfo['max_limit'] != null) {
+        final maxLimit = speedInfo['max_limit'] as String;
+        print('✅ [LOAD_SPEED] سرعت از RouterOS دریافت شد: $maxLimit');
+        // maxLimit 从 getClientSpeed 已经转换好了（M/K 格式），直接使用
+        // getClientSpeed 已经处理了所有格式转换（位格式 -> M/K 格式）
+        // 所以这里不需要再次转换
+        final formattedLimit = maxLimit;
+        
+        // فقط اگر از RouterOS 成功获取到值，才更新 state
+        setState(() {
+          _currentSpeedLimit = formattedLimit;
+        });
+        
+        // ذخیره در cache برای بارگذاری بعدی
+        _saveSpeedLimitToCache(formattedLimit);
+      } else {
+        // اگر queue وجود ندارد，但 _currentSpeedLimit 已经有值（刚刚设置的），不要清空它
+        // 因为 queue 可能需要一点时间才能在 RouterOS 中完全可用
+        // 只在页面首次加载时（_currentSpeedLimit 为 null）才清空
+        if (_currentSpeedLimit == null) {
+          setState(() {
+            _currentSpeedLimit = null;
+          });
+        } else {
+          // 如果已经有值，保留它（可能是刚刚设置的，RouterOS 还没完全创建）
+          print('⚠️ [LOAD_SPEED] Queue 在 RouterOS 中还未找到،但保留本地值: $_currentSpeedLimit');
+        }
+      }
+    } catch (e) {
+      // 检查是否是超时错误
+      final errorStr = e.toString().toLowerCase();
+      final isTimeout = errorStr.contains('timeout') || 
+                        errorStr.contains('خطا در دریافت سرعت');
+      
+      if (isTimeout) {
+        print('⚠️ [LOAD_SPEED] Timeout در بارگذاری سرعت - استفاده از cache: ${_currentSpeedLimit ?? "ندارد"}');
+      } else {
+        print('⚠️ [LOAD_SPEED] خطا در بارگذاری سرعت: $e');
+      }
+      
+      // ignore errors - این یک عملیات پس‌زمینه است
+      // 如果已经有值，不要清空它（即使从 RouterOS 加载失败）
+    } finally {
+      if (mounted && !_isDisposed) {
+        setState(() {
+          _isLoadingSpeed = false;
+        });
+      }
     }
   }
 
@@ -1191,11 +1113,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
         _isLoading = true;
       });
 
-      final banFuture = _banDeviceInternal();
-      _pendingFutures.add(banFuture);
-      
       try {
-        await banFuture;
+        await _banDeviceInternal();
       } catch (e) {
         if (!_isDisposed && mounted) {
           setState(() {
@@ -1288,11 +1207,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
         _isLoading = true;
       });
 
-      final unbanFuture = _unbanDeviceInternal();
-      _pendingFutures.add(unbanFuture);
-      
       try {
-        await unbanFuture;
+        await _unbanDeviceInternal();
       } catch (e) {
         if (!_isDisposed && mounted) {
           setState(() {
@@ -1353,18 +1269,6 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
 
   @override
   Widget build(BuildContext context) {
-    // هر بار که build فراخوانی می‌شود، اگر وضعیت Static null است و شرایط مناسب است، بررسی کن
-    // این برای حالتی است که کاربر از صفحه خارج شده و دوباره وارد شده است
-    // اما فقط اگر Dialog باز نیست
-    if (_isStatic == null && !_isLoadingStatic && !_isLoadingStatus && !_isDialogOpen &&
-        widget.device.ipAddress != null && !widget.isBanned) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _isStatic == null && !_isLoadingStatic && !_isDialogOpen) {
-          _checkStaticStatus();
-        }
-      });
-    }
-
     return PopScope(
       canPop: true,
       onPopInvoked: (didPop) {
@@ -1492,15 +1396,11 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                           _buildInfoRow('آدرس IP', widget.device.ipAddress!),
                         if (widget.device.macAddress != null)
                           _buildInfoRow('آدرس MAC', widget.device.macAddress!),
-                        if (_isStatic != null && !widget.isBanned)
-                          _buildInfoRow(
-                            'وضعیت IP',
-                            _isStatic == true
-                                ? 'Static (ثابت)'
-                                : 'Dynamic (پویا)',
-                          ),
                         if (widget.device.hostName != null)
                           _buildInfoRow('نام میزبان', widget.device.hostName!),
+                        // نمایش وضعیت Lease (Static/Dynamic)
+                        if (!widget.isBanned && (widget.device.ipAddress != null || widget.device.macAddress != null))
+                          _buildLeaseStatusRow(),
                         if (widget.device.uptime != null)
                           _buildInfoRow('زمان اتصال', widget.device.uptime!),
                         if (widget.device.ssid != null)
@@ -1510,6 +1410,9 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                             'قدرت سیگنال',
                             widget.device.signalStrength!,
                           ),
+                        // نمایش سرعت تنظیم شده (با نمایش بهتر)
+                        if (_currentSpeedLimit != null && !widget.isBanned)
+                          _buildSpeedLimitRow(_currentSpeedLimit!),
                         if (widget.isBanned)
                           Container(
                             padding: const EdgeInsets.all(12),
@@ -1532,11 +1435,7 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                                 ),
                               ],
                             ),
-                          )
-                        else ...[
-                          if (_speedLimit != null && _speedLimit != 'N/A')
-                            _buildSpeedInfoRow(_speedLimit!),
-                        ],
+                          ),
                       ],
                     ),
                   ),
@@ -1575,24 +1474,8 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
                         ),
                         const SizedBox(height: 12),
                         if (!widget.isBanned)
-                          ElevatedButton.icon(
-                            onPressed: _isLoading ? null : _toggleStaticStatus,
-                            icon: Icon(_isStatic == true ? Icons.lock : Icons.lock_open),
-                            label: Text(
-                              _isStatic == true ? 'تبدیل به غیر Static' : 'تبدیل به Static',
-                              style: const TextStyle(fontSize: 20),
-                            ),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: _isStatic == true ? Colors.orange : Colors.blue,
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(vertical: 16),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              disabledBackgroundColor: Colors.grey,
-                            ),
-                          ),
-                        if (!widget.isBanned) const SizedBox(height: 12),
+                          _buildStaticLeaseButton(),
+                        const SizedBox(height: 12),
                         if (widget.isBanned)
                           ElevatedButton.icon(
                             onPressed: _unbanDevice,
@@ -1769,6 +1652,98 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     );
   }
 
+  /// نمایش سرعت با فرمت کاربرپسند (با مشخص کردن دانلود و آپلود)
+  Widget _buildSpeedLimitRow(String speedLimit) {
+    // پارس کردن سرعت: "8M/7M" -> upload: 8M, download: 7M
+    String uploadSpeed = '';
+    String downloadSpeed = '';
+    
+    if (speedLimit.contains('/')) {
+      final parts = speedLimit.split('/');
+      if (parts.length == 2) {
+        uploadSpeed = parts[0].trim();
+        downloadSpeed = parts[1].trim();
+      }
+    } else {
+      // اگر فقط یک مقدار است، برای هر دو استفاده می‌شود
+      uploadSpeed = speedLimit;
+      downloadSpeed = speedLimit;
+    }
+    
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 120,
+            child: Text(
+              'حداکثر',
+              style: TextStyle(
+                color: Colors.grey.shade600,
+                fontSize: 14,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // آپلود
+                Row(
+                  children: [
+                    const Icon(Icons.upload, color: Colors.green, size: 16),
+                    const SizedBox(width: 6),
+                    Text(
+                      'آپلود: ',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Colors.grey.shade700,
+                      ),
+                    ),
+                    Text(
+                      uploadSpeed,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.green,
+                      ),
+                      textDirection: TextDirection.ltr,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                // دانلود
+                Row(
+                  children: [
+                    const Icon(Icons.download, color: Colors.blue, size: 16),
+                    const SizedBox(width: 6),
+                    Text(
+                      'دانلود: ',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Colors.grey.shade700,
+                      ),
+                    ),
+                    Text(
+                      downloadSpeed,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.blue,
+                      ),
+                      textDirection: TextDirection.ltr,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   IconData _getDeviceIcon(String type) {
     switch (type) {
       case 'wireless':
@@ -1799,81 +1774,604 @@ class _DeviceDetailScreenState extends State<DeviceDetailScreen> with WidgetsBin
     }
   }
 
-  Widget _buildSpeedInfoRow(String speedLimit) {
-    // تجزیه سرعت به آپلود و دانلود
-    final parts = speedLimit.split('/');
-    String uploadSpeed = '';
-    String downloadSpeed = '';
+  /// تبدیل Dynamic DHCP Lease به Static Lease
+  Future<void> _makeStaticLease() async {
+    print('═══════════════════════════════════════════════════════════');
+    print('📱 [UI_STATIC] شروع فرآیند Static در UI');
+    print('📱 [UI_STATIC] Device IP: ${widget.device.ipAddress ?? "N/A"}');
+    print('📱 [UI_STATIC] Device MAC: ${widget.device.macAddress ?? "N/A"}');
+    print('📱 [UI_STATIC] Device Hostname: ${widget.device.hostName ?? "N/A"}');
+    print('📱 [UI_STATIC] Is Banned: ${widget.isBanned}');
+    print('📱 [UI_STATIC] Is Disposed: $_isDisposed');
     
-    if (parts.length == 2) {
-      uploadSpeed = parts[0].trim();
-      downloadSpeed = parts[1].trim();
-    } else {
-      uploadSpeed = speedLimit;
-      downloadSpeed = speedLimit;
+    if (_isDisposed || widget.device.ipAddress == null || widget.isBanned) {
+      print('⚠️ [UI_STATIC] عملیات لغو شد - شرایط نامناسب');
+      print('═══════════════════════════════════════════════════════════');
+      return;
     }
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              SizedBox(
-                width: 120,
-                child: Text(
-                  'حداکثر سرعت',
-                  style: TextStyle(
-                    color: Colors.grey.shade600,
-                    fontSize: 14,
-                  ),
-                ),
+    // نمایش Dialog تأیید
+    print('💬 [UI_STATIC] نمایش Dialog تأیید...');
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.lock_clock, color: Colors.orange),
+            SizedBox(width: 8),
+            Text('Static کردن دستگاه'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'آیا می‌خواهید این دستگاه را به Static تبدیل کنید؟',
+              style: TextStyle(fontSize: 16),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blue.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.blue.shade200),
               ),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.download, size: 16, color: Colors.blue),
-                        const SizedBox(width: 4),
-                        Text(
-                          '$downloadSpeed',
-                          style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w500,
-                            color: Colors.blue,
-                          ),
-                          textDirection: TextDirection.ltr,
-                        ),
-                      ],
+              child: const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'مزایای Static Lease:',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
                     ),
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        const Icon(Icons.upload, size: 16, color: Colors.green),
-                        const SizedBox(width: 4),
-                        Text(
-                          '$uploadSpeed',
-                          style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w500,
-                            color: Colors.green,
-                          ),
-                          textDirection: TextDirection.ltr,
-                        ),
-                      ],
-                    ),                
-                  ],
-                ),
+                  ),
+                  SizedBox(height: 8),
+                  Text('• IP address همیشه یکسان است'),
+                  Text('• Hostname ثابت می‌ماند'),
+                  Text('• شناسایی دستگاه آسان‌تر است'),
+                  Text('• برای Ban بهتر است'),
+                ],
               ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('لغو'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.orange,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('تأیید'),
+          ),
+        ],
+      ),
+    );
+
+    print('💬 [UI_STATIC] نتیجه Dialog: ${confirm == true ? "تأیید" : "لغو"}');
+
+    if (confirm != true || _isDisposed || !mounted) {
+      print('⚠️ [UI_STATIC] عملیات لغو شد - کاربر تأیید نکرد یا صفحه dispose شده');
+      print('═══════════════════════════════════════════════════════════');
+      return;
+    }
+
+    print('🔄 [UI_STATIC] تنظیم loading state...');
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      print('📞 [UI_STATIC] فراخوانی Provider.makeStaticLease()...');
+      final provider = Provider.of<ClientsProvider>(context, listen: false);
+      final result = await provider.makeStaticLease(
+        macAddress: widget.device.macAddress,
+        ipAddress: widget.device.ipAddress,
+        hostname: widget.device.hostName,
+        comment: 'Static via Flutter App',
+      ).timeout(
+        const Duration(seconds: 30),
+        onTimeout: () {
+          print('⏱️ [UI_STATIC] Timeout در فراخوانی Provider (30 ثانیه)');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('زمان Static کردن به پایان رسید'),
+                backgroundColor: Colors.orange,
+              ),
+            );
+          }
+          return {'success': false, 'error': 'Timeout'};
+        },
+      );
+
+      print('📥 [UI_STATIC] نتیجه از Provider دریافت شد');
+      print('   Success: ${result['success']}');
+      print('   Message: ${result['message'] ?? result['error']}');
+
+      if (!mounted || _isDisposed) {
+        print('⚠️ [UI_STATIC] صفحه dispose شده - نمایش نتیجه لغو شد');
+        print('═══════════════════════════════════════════════════════════');
+        return;
+      }
+
+      if (result['success'] == true) {
+        print('✅ [UI_STATIC] تبدیل موفق - نمایش پیام موفقیت');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.check_circle, color: Colors.white),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(result['message'] ?? 'دستگاه با موفقیت Static شد'),
+                ),
+              ],
+            ),
+            backgroundColor: Colors.green,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+
+        // به‌روزرسانی وضعیت (فوراً)
+        print('🔄 [UI_STATIC] به‌روزرسانی وضعیت UI...');
+        if (mounted && !_isDisposed) {
+          setState(() {
+            _isStaticLease = true; // فوراً به‌روزرسانی کن
+            _isLoadingLeaseStatus = false; // اگر در حال loading بود، متوقف کن
+          });
+        }
+
+        // تازه‌سازی داده‌ها (در پس‌زمینه، بدون blocking کردن UI)
+        print('🔄 [UI_STATIC] تازه‌سازی داده‌ها در پس‌زمینه...');
+        Future.microtask(() async {
+          try {
+            await provider.refresh();
+            // بعد از refresh، دوباره وضعیت lease را بررسی کن (برای اطمینان)
+            Future.delayed(const Duration(milliseconds: 500), () {
+              if (mounted && !_isDisposed) {
+                _loadLeaseStatus();
+              }
+            });
+            print('✅ [UI_STATIC] داده‌ها تازه‌سازی شدند');
+          } catch (e) {
+            print('⚠️ [UI_STATIC] خطا در تازه‌سازی داده‌ها: $e');
+            // حتی اگر refresh خطا داد، وضعیت UI را حفظ کن
+          }
+        });
+        print('✅ [UI_STATIC] فرآیند Static با موفقیت کامل شد');
+        print('═══════════════════════════════════════════════════════════');
+      } else {
+        print('❌ [UI_STATIC] تبدیل ناموفق - نمایش پیام خطا');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.error, color: Colors.white),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(result['error'] ?? 'خطا در Static کردن دستگاه'),
+                ),
+              ],
+            ),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        print('═══════════════════════════════════════════════════════════');
+      }
+    } catch (e, stackTrace) {
+      print('❌ [UI_STATIC] خطای استثنا در فرآیند Static');
+      print('   Error: $e');
+      print('   Type: ${e.runtimeType}');
+      print('   Stack: $stackTrace');
+      
+      if (!mounted || _isDisposed) {
+        print('⚠️ [UI_STATIC] صفحه dispose شده - نمایش خطا لغو شد');
+        print('═══════════════════════════════════════════════════════════');
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.error, color: Colors.white),
+              const SizedBox(width: 8),
+              Expanded(child: Text('خطا: $e')),
             ],
+          ),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      print('═══════════════════════════════════════════════════════════');
+    } finally {
+      if (mounted && !_isDisposed) {
+        print('🔄 [UI_STATIC] تنظیم loading state به false');
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  /// بارگذاری وضعیت Lease (Static/Dynamic)
+  Future<void> _loadLeaseStatus() async {
+    if (_isDisposed || widget.device.ipAddress == null && widget.device.macAddress == null) {
+      return;
+    }
+
+    if (_isLoadingLeaseStatus) {
+      return; // در حال بارگذاری است
+    }
+
+    setState(() {
+      _isLoadingLeaseStatus = true;
+    });
+
+    try {
+      final provider = Provider.of<ClientsProvider>(context, listen: false);
+      final serviceManager = MikroTikServiceManager();
+      
+      if (!serviceManager.isConnected) {
+        if (mounted && !_isDisposed) {
+          setState(() {
+            _isLoadingLeaseStatus = false;
+            _isStaticLease = null;
+          });
+        }
+        return;
+      }
+
+      // استفاده از service manager برای دریافت lease status
+      final leaseStatus = await provider.getLeaseStatus(
+        macAddress: widget.device.macAddress,
+        ipAddress: widget.device.ipAddress,
+      );
+
+      if (mounted && !_isDisposed) {
+        setState(() {
+          _isStaticLease = leaseStatus;
+          _isLoadingLeaseStatus = false;
+        });
+      }
+    } catch (e) {
+      print('⚠️ [DEVICE_DETAIL] خطا در بارگذاری وضعیت Lease: $e');
+      if (mounted && !_isDisposed) {
+        setState(() {
+          _isLoadingLeaseStatus = false;
+          _isStaticLease = null;
+        });
+      }
+    }
+  }
+
+  /// ساخت ردیف نمایش وضعیت Lease
+  Widget _buildLeaseStatusRow() {
+    if (_isLoadingLeaseStatus) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Row(
+          children: [
+            const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              'در حال بررسی وضعیت Lease...',
+              style: TextStyle(
+                fontSize: 14,
+                color: Colors.grey.shade600,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_isStaticLease == null) {
+      return const SizedBox.shrink(); // وضعیت نامشخص - نمایش نده
+    }
+
+    final isStatic = _isStaticLease == true;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      margin: const EdgeInsets.only(top: 8),
+      decoration: BoxDecoration(
+        color: isStatic ? Colors.orange.withOpacity(0.1) : Colors.blue.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: isStatic ? Colors.orange.withOpacity(0.3) : Colors.blue.withOpacity(0.3),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isStatic ? Icons.lock_clock : Icons.lock_open,
+            color: isStatic ? Colors.orange : Colors.blue,
+            size: 20,
+          ),
+          const SizedBox(width: 8),
+          Text(
+            isStatic ? 'Lease: Static (ثابت)' : 'Lease: Dynamic (پویا)',
+            style: TextStyle(
+              color: isStatic ? Colors.orange.shade700 : Colors.blue.shade700,
+              fontWeight: FontWeight.bold,
+              fontSize: 14,
+            ),
           ),
         ],
       ),
     );
   }
+
+  /// ساخت دکمه Static/Dynamic بر اساس وضعیت
+  Widget _buildStaticLeaseButton() {
+    if (_isLoadingLeaseStatus) {
+      return ElevatedButton.icon(
+        onPressed: null,
+        icon: const SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+        ),
+        label: const Text('در حال بررسی...', style: TextStyle(fontSize: 20)),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.grey,
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+      );
+    }
+
+    final isStatic = _isStaticLease == true;
+    
+    return ElevatedButton.icon(
+      onPressed: _isLoading ? null : (isStatic ? _makeDynamicLease : _makeStaticLease),
+      icon: Icon(isStatic ? Icons.lock_open : Icons.lock_clock),
+      label: Text(
+        isStatic ? 'بازگشت به Dynamic' : 'Static کردن',
+        style: const TextStyle(fontSize: 20),
+      ),
+      style: ElevatedButton.styleFrom(
+        backgroundColor: isStatic ? Colors.blue : Colors.orange,
+        foregroundColor: Colors.white,
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
+      ),
+    );
+  }
+
+  /// تبدیل Static Lease به Dynamic Lease
+  Future<void> _makeDynamicLease() async {
+    print('═══════════════════════════════════════════════════════════');
+    print('📱 [UI_DYNAMIC] شروع فرآیند Dynamic در UI');
+    print('📱 [UI_DYNAMIC] Device IP: ${widget.device.ipAddress ?? "N/A"}');
+    print('📱 [UI_DYNAMIC] Device MAC: ${widget.device.macAddress ?? "N/A"}');
+    
+    if (_isDisposed || widget.device.ipAddress == null || widget.isBanned) {
+      print('⚠️ [UI_DYNAMIC] عملیات لغو شد - شرایط نامناسب');
+      print('═══════════════════════════════════════════════════════════');
+      return;
+    }
+
+    // نمایش Dialog تأیید
+    print('💬 [UI_DYNAMIC] نمایش Dialog تأیید...');
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.lock_open, color: Colors.blue),
+            SizedBox(width: 8),
+            Text('بازگشت به Dynamic'),
+          ],
+        ),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'آیا می‌خواهید این دستگاه را به Dynamic تبدیل کنید؟',
+              style: TextStyle(fontSize: 16),
+            ),
+            SizedBox(height: 16),
+            Text(
+              'توجه: با تبدیل به Dynamic، IP address ممکن است تغییر کند.',
+              style: TextStyle(fontSize: 14, color: Colors.orange),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('لغو'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('تأیید'),
+          ),
+        ],
+      ),
+    );
+
+    print('💬 [UI_DYNAMIC] نتیجه Dialog: ${confirm == true ? "تأیید" : "لغو"}');
+
+    if (confirm != true || _isDisposed || !mounted) {
+      print('⚠️ [UI_DYNAMIC] عملیات لغو شد');
+      print('═══════════════════════════════════════════════════════════');
+      return;
+    }
+
+    print('🔄 [UI_DYNAMIC] تنظیم loading state...');
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      print('📞 [UI_DYNAMIC] فراخوانی Provider.makeDynamicLease()...');
+      final provider = Provider.of<ClientsProvider>(context, listen: false);
+      
+      if (!provider.isConnected) {
+        throw Exception('اتصال برقرار نشده');
+      }
+
+      final result = await provider.makeDynamicLease(
+        macAddress: widget.device.macAddress,
+        ipAddress: widget.device.ipAddress,
+      ).timeout(
+        const Duration(seconds: 35), // کمی بیشتر از provider timeout
+        onTimeout: () {
+          print('⏱️ [UI_DYNAMIC] Timeout در فراخوانی Provider (35 ثانیه)');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('زمان تبدیل به Dynamic به پایان رسید'),
+                backgroundColor: Colors.orange,
+              ),
+            );
+          }
+          throw TimeoutException('Timeout', const Duration(seconds: 35));
+        },
+      );
+
+      print('📥 [UI_DYNAMIC] نتیجه از Provider دریافت شد');
+      print('   Success: ${result['success']}');
+      print('   Message: ${result['message'] ?? result['error']}');
+
+      if (!mounted || _isDisposed) {
+        print('⚠️ [UI_DYNAMIC] صفحه dispose شده');
+        print('═══════════════════════════════════════════════════════════');
+        return;
+      }
+
+      if (result['success'] == true) {
+        print('✅ [UI_DYNAMIC] تبدیل موفق');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.check_circle, color: Colors.white),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(result['message'] ?? 'دستگاه با موفقیت Dynamic شد'),
+                ),
+              ],
+            ),
+            backgroundColor: Colors.green,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+
+        // به‌روزرسانی وضعیت
+        setState(() {
+          _isStaticLease = false;
+        });
+
+        // به‌روزرسانی وضعیت (فوراً)
+        print('🔄 [UI_DYNAMIC] به‌روزرسانی وضعیت UI...');
+        if (mounted && !_isDisposed) {
+          setState(() {
+            _isStaticLease = false; // فوراً به‌روزرسانی کن
+            _isLoadingLeaseStatus = false; // اگر در حال loading بود، متوقف کن
+          });
+        }
+
+        // تازه‌سازی داده‌ها (در پس‌زمینه، بدون blocking کردن UI)
+        print('🔄 [UI_DYNAMIC] تازه‌سازی داده‌ها در پس‌زمینه...');
+        Future.microtask(() async {
+          try {
+            await provider.refresh();
+            // بعد از refresh، دوباره وضعیت lease را بررسی کن (برای اطمینان)
+            Future.delayed(const Duration(milliseconds: 500), () {
+              if (mounted && !_isDisposed) {
+                _loadLeaseStatus();
+              }
+            });
+            print('✅ [UI_DYNAMIC] داده‌ها تازه‌سازی شدند');
+          } catch (e) {
+            print('⚠️ [UI_DYNAMIC] خطا در تازه‌سازی داده‌ها: $e');
+            // حتی اگر refresh خطا داد، وضعیت UI را حفظ کن
+          }
+        });
+        print('✅ [UI_DYNAMIC] فرآیند Dynamic با موفقیت کامل شد');
+        print('═══════════════════════════════════════════════════════════');
+      } else {
+        print('❌ [UI_DYNAMIC] تبدیل ناموفق');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.error, color: Colors.white),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(result['message'] ?? 'خطا در Dynamic کردن دستگاه'),
+                ),
+              ],
+            ),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        print('═══════════════════════════════════════════════════════════');
+      }
+    } catch (e, stackTrace) {
+      print('❌ [UI_DYNAMIC] خطای استثنا در فرآیند Dynamic');
+      print('   Error: $e');
+      print('   Type: ${e.runtimeType}');
+      print('   Stack: $stackTrace');
+      
+      if (!mounted || _isDisposed) {
+        print('⚠️ [UI_DYNAMIC] صفحه dispose شده');
+        print('═══════════════════════════════════════════════════════════');
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.error, color: Colors.white),
+              const SizedBox(width: 8),
+              Expanded(child: Text('خطا: $e')),
+            ],
+          ),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      print('═══════════════════════════════════════════════════════════');
+    } finally {
+      if (mounted && !_isDisposed) {
+        print('🔄 [UI_DYNAMIC] تنظیم loading state به false');
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
 }
 
 

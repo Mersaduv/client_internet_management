@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async';
 import '../models/mikrotik_connection.dart';
 import '../models/client_info.dart';
 import '../models/device_fingerprint.dart';
@@ -626,35 +627,6 @@ class MikroTikService {
         }
       }
 
-      // 5. ایجاد Static IP - برای شناسایی بهتر دستگاه در آینده
-      // با Static IP، دستگاه همیشه همان IP را می‌گیرد و شناسایی راحت‌تر می‌شود
-      if (macToUse != null) {
-        try {
-          // پیدا کردن hostname از DHCP lease
-          String? hostname;
-          try {
-            final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-            for (var lease in dhcpLeases) {
-              final leaseMac = lease['mac-address']?.toString().toUpperCase();
-              if (leaseMac == macToUse.toUpperCase()) {
-                hostname = lease['host-name'];
-                break;
-              }
-            }
-          } catch (e) {
-            // ignore
-          }
-
-          await _createOrUpdateStaticLease(
-            ipAddress,
-            macToUse,
-            hostname: hostname,
-            comment: '$banComment - Static IP',
-          );
-        } catch (e) {
-          // ignore - ادامه بده
-        }
-      }
 
       return true;
     } catch (e) {
@@ -1379,122 +1351,385 @@ class MikroTikService {
   /// تنظیم سرعت کلاینت
   /// مشابه POST /api/clients/set-speed
   /// maxLimit باید به فرمت upload/download باشد (مثال: 10M/10M یا 5000K/2000K)
+  /// مقایسه دو max-limit (پشتیبانی از فرمت بیت و M/K)
+  /// مثال: "6000000/6000000" == "6M/6M" => true
+  bool _compareMaxLimit(String limit1, String limit2) {
+    if (limit1 == limit2) return true;
+    
+    try {
+      // تبدیل هر دو به فرمت بیت برای مقایسه
+      String normalizeLimit(String limit) {
+        if (limit.contains('/')) {
+          final parts = limit.split('/');
+          if (parts.length == 2) {
+            final part1 = parts[0].trim();
+            final part2 = parts[1].trim();
+            
+            // تبدیل به بیت
+            int toBits(String value) {
+              final match = RegExp(r'^(\d+)([KMkm]?)$').firstMatch(value);
+              if (match != null) {
+                final numValue = int.tryParse(match.group(1) ?? '0') ?? 0;
+                final unit = (match.group(2) ?? '').toUpperCase();
+                if (unit == 'M') {
+                  return numValue * 1000000;
+                } else if (unit == 'K') {
+                  return numValue * 1000;
+                } else {
+                  // اگر واحد ندارد، فرض می‌کنیم بیت است
+                  return numValue;
+                }
+              }
+              // اگر parse نشد، سعی می‌کنیم به عنوان عدد مستقیم استفاده کنیم
+              return int.tryParse(value) ?? 0;
+            }
+            
+            return '${toBits(part1)}/${toBits(part2)}';
+          }
+        }
+        return limit;
+      }
+      
+      final normalized1 = normalizeLimit(limit1);
+      final normalized2 = normalizeLimit(limit2);
+      
+      return normalized1 == normalized2;
+    } catch (e) {
+      // اگر تبدیل ناموفق بود، مقایسه مستقیم انجام می‌دهیم
+      return limit1 == limit2;
+    }
+  }
+
+  /// تنظیم سرعت کلاینت با استفاده از Simple Queue
+  /// این متد منطق کامل را پیاده‌سازی می‌کند:
+  /// 1️⃣ پیدا کردن Simple Queue با IP
+  /// 2️⃣ ویرایش Simple Queue اگر موجود باشد
+  /// 3️⃣ ایجاد Simple Queue اگر وجود نداشت
   Future<bool> setClientSpeed(String target, String maxLimit) async {
     if (_client == null || !isConnected) {
       throw Exception('اتصال برقرار نشده');
     }
-
+    
     try {
-      // تبدیل فرمت M/K به بیت بر ثانیه
-      String maxLimitInBits = maxLimit;
-      if (maxLimit.contains('/')) {
-        final parts = maxLimit.split('/');
-        if (parts.length == 2) {
-          final uploadPart = parts[0].trim();
-          final downloadPart = parts[1].trim();
-          
-          // تبدیل آپلود
-          int uploadBits = 0;
-          final uploadMatch = RegExp(r'^(\d+)([KMkm]?)$').firstMatch(uploadPart);
-          if (uploadMatch != null) {
-            final value = int.tryParse(uploadMatch.group(1) ?? '0') ?? 0;
-            final unit = (uploadMatch.group(2) ?? 'M').toUpperCase();
-            if (unit == 'M') {
-              uploadBits = value * 1000000; // Mbps به بیت
-            } else if (unit == 'K') {
-              uploadBits = value * 1000; // Kbps به بیت
-            } else {
-              uploadBits = value * 1000000; // پیش‌فرض Mbps
+      print('🔧 [SET_SPEED] شروع تنظیم سرعت - Target: $target, MaxLimit: $maxLimit');
+      
+      // تبدیل فرمت M/K به فرمت MikroTik (مثال: 4M/12M)
+      // RouterOS v6 از فرمت M/K پشتیبانی می‌کند، نیازی به تبدیل به بیت نیست
+      String maxLimitFormatted = maxLimit;
+
+      // بررسی اینکه target IP است یا MAC
+      final isMacAddress = target.contains(':') && target.split(':').length == 6;
+      String? targetIp = target.split('/')[0].trim();
+      
+      // اگر target MAC است، ابتدا IP مربوطه را پیدا کن
+      if (isMacAddress) {
+        try {
+          print('🔧 [SET_SPEED] جستجوی IP برای MAC: $target');
+          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print'])
+              .timeout(const Duration(seconds: 10));
+          for (var lease in dhcpLeases) {
+            final leaseMac = lease['mac-address']?.toString().toUpperCase();
+            if (leaseMac == target.toUpperCase()) {
+              targetIp = lease['address']?.toString();
+              print('🔧 [SET_SPEED] IP پیدا شد از DHCP: $targetIp');
+              break;
             }
           }
           
-          // تبدیل دانلود
-          int downloadBits = 0;
-          final downloadMatch = RegExp(r'^(\d+)([KMkm]?)$').firstMatch(downloadPart);
-          if (downloadMatch != null) {
-            final value = int.tryParse(downloadMatch.group(1) ?? '0') ?? 0;
-            final unit = (downloadMatch.group(2) ?? 'M').toUpperCase();
-            if (unit == 'M') {
-              downloadBits = value * 1000000; // Mbps به بیت
-            } else if (unit == 'K') {
-              downloadBits = value * 1000; // Kbps به بیت
-            } else {
-              downloadBits = value * 1000000; // پیش‌فرض Mbps
+          if (targetIp == target.split('/')[0].trim()) {
+            final arpEntries = await _client!.talk(['/ip/arp/print'])
+                .timeout(const Duration(seconds: 10));
+            for (var arp in arpEntries) {
+              final arpMac = arp['mac-address']?.toString().toUpperCase();
+              if (arpMac == target.toUpperCase()) {
+                targetIp = arp['address']?.toString();
+                print('🔧 [SET_SPEED] IP پیدا شد از ARP: $targetIp');
+                break;
+              }
             }
           }
-          
-          maxLimitInBits = '$uploadBits/$downloadBits';
+        } catch (e) {
+          print('⚠️ [SET_SPEED] خطا در پیدا کردن IP: $e');
+          // ignore errors
         }
       }
-
-      // پیدا کردن queue موجود با مقایسه IP
-      final queues = await _client!.talk(['/queue/simple/print']);
-      String? queueId;
-      final targetIp = target.split('/')[0].trim();
       
-      for (var queue in queues) {
-        final queueTarget = queue['target']?.toString() ?? '';
-        if (queueTarget.isEmpty) continue;
-        
-        final queueTargetIp = queueTarget.split('/')[0].trim();
-        
-        // مقایسه IP ها
-        if (queueTargetIp == targetIp || 
-            queueTarget == target || 
-            queueTarget.startsWith('$targetIp/')) {
-          queueId = queue['.id'];
-          break;
-        }
+      if (targetIp == null || (targetIp == target.split('/')[0].trim() && isMacAddress)) {
+        throw Exception('نتوانست IP را برای target پیدا کند: $target');
       }
 
       // استفاده از IP با /32 برای target
-      final targetWithSubnet = target.contains('/') ? target : '$target/32';
+      final targetIpClean = targetIp.split('/')[0].trim();
+      final targetWithSubnet = targetIp.contains('/') ? targetIp : '$targetIp/32';
+      print('🔧 [SET_SPEED] IP نهایی: $targetIpClean, Target: $targetWithSubnet');
 
-      if (queueId != null) {
-        // به‌روزرسانی queue موجود
-        await _client!.talk(['/queue/simple/set', '=.id=$queueId', '=max-limit=$maxLimitInBits']);
-      } else {
-        // ایجاد queue جدید
-        await _client!.talk(['/queue/simple/add', '=target=$targetWithSubnet', '=max-limit=$maxLimitInBits']);
-      }
-
-      // ایجاد Static IP برای شناسایی بهتر دستگاه در آینده
+      // استراتژی جدید: ابتدا جستجوی queue موجود
+      // اگر queue موجود باشد، ویرایش می‌کنیم
+      // اگر queue موجود نباشد، ایجاد می‌کنیم
+      final queueName = 'DEV-$targetIpClean';
+      
+      // 1️⃣ جستجوی queue موجود (از طریق target یا name)
+      // 使用较短的超时时间（4秒），如果超时立即尝试创建，避免长时间等待
       try {
-        // پیدا کردن MAC address از IP
-        String? macAddress;
-        final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-        for (var lease in dhcpLeases) {
-          if (lease['address'] == targetIp) {
-            macAddress = lease['mac-address'];
+        print('🔧 [SET_SPEED] جستجوی queue موجود برای IP: $targetIpClean');
+        final allQueues = await _client!.talk(['/queue/simple/print'])
+            .timeout(const Duration(seconds: 4));
+        
+        String? queueId;
+        String? currentMaxLimit;
+        
+        for (var queue in allQueues) {
+          final queueTarget = queue['target']?.toString() ?? '';
+          final queueNameCheck = queue['name']?.toString() ?? '';
+          
+          if (queueTarget.isEmpty && queueNameCheck.isEmpty) continue;
+          
+          final queueTargetIp = queueTarget.split('/')[0].trim();
+          final targetMatches = queueTargetIp == targetIpClean || 
+                                queueTarget == targetWithSubnet ||
+                                queueTarget.startsWith('$targetIpClean/') ||
+                                queueTarget == targetIp;
+          final nameMatches = queueNameCheck == queueName;
+          
+          if (targetMatches || nameMatches) {
+            queueId = queue['.id']?.toString() ?? queue['id']?.toString();
+            currentMaxLimit = queue['max-limit']?.toString() ?? '';
+            print('✅ [SET_SPEED] Queue موجود پیدا شد - ID: $queueId, Current Limit: $currentMaxLimit');
             break;
           }
         }
         
-        // اگر در DHCP پیدا نشد، در ARP table جستجو کن
-        if (macAddress == null) {
-          final arpEntries = await _client!.talk(['/ip/arp/print']);
-          for (var arp in arpEntries) {
-            if (arp['address'] == targetIp) {
-              macAddress = arp['mac-address'];
+        // 2️⃣ اگر queue موجود باشد، ویرایش می‌کنیم
+        if (queueId != null && queueId.isNotEmpty) {
+          try {
+            print('🔧 [SET_SPEED] در حال ویرایش queue موجود - ID: $queueId');
+            await _client!.talk([
+              '/queue/simple/set',
+              '=.id=$queueId',
+              '=max-limit=$maxLimitFormatted'
+            ]).timeout(const Duration(seconds: 3));
+            
+            print('✅ [SET_SPEED] Queue با ID $queueId برای IP $targetIpClean به‌روزرسانی شد: $maxLimitFormatted');
+            return true;
+          } catch (e2) {
+            print('❌ [SET_SPEED] خطا در ویرایش queue: $e2');
+            throw Exception('خطا در ویرایش queue: $e2');
+          }
+        }
+      } catch (e) {
+        // اگر جستجو ناموفق بود، ادامه می‌دهیم و سعی می‌کنیم queue جدید ایجاد کنیم
+        print('⚠️ [SET_SPEED] خطا در جستجوی queue (ادامه برای ایجاد queue جدید): $e');
+      }
+      
+      // 3️⃣ اگر queue موجود نباشد، ایجاد می‌کنیم
+      try {
+        print('🔧 [SET_SPEED] Queue موجود نیست - در حال ایجاد queue جدید - Name: $queueName');
+        await _client!.talk([
+          '/queue/simple/add',
+          '=name=$queueName',
+          '=target=$targetWithSubnet',
+          '=max-limit=$maxLimitFormatted'
+        ]).timeout(const Duration(seconds: 3));
+        
+        print('✅ [SET_SPEED] Queue جدید برای IP $targetIpClean ایجاد شد: $maxLimitFormatted');
+        return true;
+      } catch (e) {
+        final errorStr = e.toString().toLowerCase();
+        // بررسی انواع خطاهای duplicate: duplicate, already exists, already have such name
+        final isDuplicate = errorStr.contains('duplicate') || 
+                           errorStr.contains('already exists') ||
+                           errorStr.contains('already have such name') ||
+                           errorStr.contains('such name');
+        
+        // اگر duplicate 错误，说明 queue 已存在，尝试再次搜索并编辑
+        if (isDuplicate) {
+          print('⚠️ [SET_SPEED] Queue از قبل وجود دارد (duplicate error) - در حال جستجوی مجدد...');
+          try {
+            // 既然知道 queue 存在，使用较长的超时时间确保找到
+            final allQueues = await _client!.talk(['/queue/simple/print'])
+                .timeout(const Duration(seconds: 8));
+            
+            String? queueId;
+            for (var queue in allQueues) {
+              final queueTarget = queue['target']?.toString() ?? '';
+              final queueNameCheck = queue['name']?.toString() ?? '';
+              
+              if (queueTarget.isEmpty && queueNameCheck.isEmpty) continue;
+              
+              final queueTargetIp = queueTarget.split('/')[0].trim();
+              final targetMatches = queueTargetIp == targetIpClean || 
+                                    queueTarget == targetWithSubnet ||
+                                    queueTarget.startsWith('$targetIpClean/') ||
+                                    queueTarget == targetIp;
+              final nameMatches = queueNameCheck == queueName;
+              
+              if (targetMatches || nameMatches) {
+                queueId = queue['.id']?.toString() ?? queue['id']?.toString();
+                if (queueId != null && queueId.isNotEmpty) {
+                  print('✅ [SET_SPEED] Queue پیدا شد - ID: $queueId, در حال ویرایش...');
+                  await _client!.talk([
+                    '/queue/simple/set',
+                    '=.id=$queueId',
+                    '=max-limit=$maxLimitFormatted'
+                  ]).timeout(const Duration(seconds: 3));
+                  
+                  print('✅ [SET_SPEED] Queue با ID $queueId ویرایش شد: $maxLimitFormatted');
+                  return true;
+                }
+              }
+            }
+            
+            // 如果搜索后仍然找不到，说明可能是其他问题
+            print('⚠️ [SET_SPEED] Queue duplicate گزارش شد اما در جستجوی مجدد پیدا نشد');
+          } catch (e2) {
+            print('⚠️ [SET_SPEED] خطا در جستجوی مجدد: $e2');
+          }
+        }
+        
+        // 即使不是 duplicate 错误，也尝试最后一次搜索（可能搜索超时了）
+        print('⚠️ [SET_SPEED] خطا در ایجاد queue - در حال آخرین تلاش برای جستجو و ویرایش...');
+        try {
+          final allQueues = await _client!.talk(['/queue/simple/print'])
+              .timeout(const Duration(seconds: 8));
+          
+          String? queueId;
+          for (var queue in allQueues) {
+            final queueTarget = queue['target']?.toString() ?? '';
+            final queueNameCheck = queue['name']?.toString() ?? '';
+            
+            if (queueTarget.isEmpty && queueNameCheck.isEmpty) continue;
+            
+            final queueTargetIp = queueTarget.split('/')[0].trim();
+            final targetMatches = queueTargetIp == targetIpClean || 
+                                  queueTarget == targetWithSubnet ||
+                                  queueTarget.startsWith('$targetIpClean/') ||
+                                  queueTarget == targetIp;
+            final nameMatches = queueNameCheck == queueName;
+            
+            if (targetMatches || nameMatches) {
+              queueId = queue['.id']?.toString() ?? queue['id']?.toString();
+              if (queueId != null && queueId.isNotEmpty) {
+                print('✅ [SET_SPEED] Queue در آخرین تلاش پیدا شد - ID: $queueId');
+                await _client!.talk([
+                  '/queue/simple/set',
+                  '=.id=$queueId',
+                  '=max-limit=$maxLimitFormatted'
+                ]).timeout(const Duration(seconds: 3));
+                
+                print('✅ [SET_SPEED] Queue با ID $queueId در آخرین تلاش ویرایش شد: $maxLimitFormatted');
+                return true;
+              }
+            }
+          }
+        } catch (e3) {
+          print('❌ [SET_SPEED] آخرین تلاش نیز ناموفق بود: $e3');
+        }
+        
+        print('❌ [SET_SPEED] خطا در ایجاد queue: $e');
+        throw Exception('خطا در ایجاد queue: $e');
+      }
+    } catch (e) {
+      print('❌ [SET_SPEED] خطای کلی: $e');
+      throw Exception('خطا در تنظیم سرعت: $e');
+    }
+  }
+
+  /// حذف Simple Queue بر اساس IP
+  /// 4️⃣ حذف Simple Queue: /queue simple remove [find target~"192.168.88.50"]
+  Future<bool> removeClientSpeed(String target) async {
+    if (_client == null || !isConnected) {
+      throw Exception('اتصال برقرار نشده');
+    }
+    
+    try {
+      // بررسی اینکه target IP است یا MAC
+      final isMacAddress = target.contains(':') && target.split(':').length == 6;
+      String? targetIp = target.split('/')[0].trim();
+      
+      // اگر target MAC است، ابتدا IP مربوطه را پیدا کن
+      if (isMacAddress) {
+        try {
+          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+          for (var lease in dhcpLeases) {
+            final leaseMac = lease['mac-address']?.toString().toUpperCase();
+            if (leaseMac == target.toUpperCase()) {
+              targetIp = lease['address']?.toString();
               break;
             }
           }
+          
+          if (targetIp == target.split('/')[0].trim()) {
+            final arpEntries = await _client!.talk(['/ip/arp/print']);
+            for (var arp in arpEntries) {
+              final arpMac = arp['mac-address']?.toString().toUpperCase();
+              if (arpMac == target.toUpperCase()) {
+                targetIp = arp['address']?.toString();
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          // ignore errors
         }
-
-        if (macAddress != null) {
-          await _createOrUpdateStaticLease(
-            targetIp,
-            macAddress,
-            comment: 'Static IP - Speed Limited via Flutter App',
-          );
-        }
-      } catch (e) {
-        // ignore errors - Static IP optional است
+      }
+      
+      if (targetIp == null || (targetIp == target.split('/')[0].trim() && isMacAddress)) {
+        throw Exception('نتوانست IP را برای target پیدا کند: $target');
       }
 
-      return true;
+      final targetIpClean = targetIp.split('/')[0].trim();
+      final targetWithSubnet = targetIp.contains('/') ? targetIp : '$targetIp/32';
+
+      // پیدا کردن Simple Queue با IP
+      List<Map<String, String>> queuesToRemove = [];
+      try {
+        final allQueues = await _client!.talk(['/queue/simple/print']);
+        
+        for (var queue in allQueues) {
+          final queueTarget = queue['target']?.toString() ?? '';
+          if (queueTarget.isEmpty) continue;
+          
+          final queueTargetIp = queueTarget.split('/')[0].trim();
+          
+          if (queueTargetIp == targetIpClean || 
+              queueTarget == targetWithSubnet ||
+              queueTarget.startsWith('$targetIpClean/')) {
+            queuesToRemove.add(queue);
+          }
+        }
+      } catch (e) {
+        throw Exception('خطا در پیدا کردن queue: $e');
+      }
+
+      if (queuesToRemove.isEmpty) {
+        print('⚠️ [REMOVE_SPEED] Queue برای IP $targetIpClean پیدا نشد');
+        return false;
+      }
+
+      // حذف همه queues پیدا شده
+      bool allRemoved = true;
+      for (var queue in queuesToRemove) {
+        final queueId = queue['.id'] ?? queue['id'];
+        
+        if (queueId != null && queueId.isNotEmpty) {
+          try {
+            // حذف Simple Queue: /queue simple remove [find target~"192.168.88.50"]
+            await _client!.talk([
+              '/queue/simple/remove',
+              '=.id=$queueId'
+            ]);
+            
+            print('✅ [REMOVE_SPEED] Queue با ID $queueId برای IP $targetIpClean حذف شد');
+          } catch (e) {
+            print('⚠️ [REMOVE_SPEED] خطا در حذف queue با ID $queueId: $e');
+            allRemoved = false;
+          }
+        }
+      }
+
+      return allRemoved;
     } catch (e) {
-      throw Exception('خطا در تنظیم سرعت: $e');
+      throw Exception('خطا در حذف سرعت: $e');
     }
   }
 
@@ -1506,36 +1741,131 @@ class MikroTikService {
     }
 
     try {
-      final queues = await _client!.talk(['/queue/simple/print']);
+      // بررسی اینکه target IP است یا MAC
+      final isMacAddress = target.contains(':') && target.split(':').length == 6;
+      String? targetIp = target.split('/')[0].trim();
+      String? targetMac = isMacAddress ? target.toUpperCase() : null;
       
-      // تبدیل IP به فرمت‌های مختلف برای مقایسه
-      final targetIp = target.split('/')[0].trim(); // حذف subnet mask اگر وجود دارد
+      // اگر target MAC است، ابتدا IP مربوطه را پیدا کن
+      if (isMacAddress && targetMac != null) {
+        try {
+          // از DHCP leases جستجو کن
+          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
+          for (var lease in dhcpLeases) {
+            final leaseMac = lease['mac-address']?.toString().toUpperCase();
+            if (leaseMac == targetMac) {
+              targetIp = lease['address']?.toString();
+              break;
+            }
+          }
+          
+          // اگر در DHCP پیدا نشد، از ARP table جستجو کن
+          if (targetIp == target.split('/')[0].trim()) {
+            final arpEntries = await _client!.talk(['/ip/arp/print']);
+            for (var arp in arpEntries) {
+              final arpMac = arp['mac-address']?.toString().toUpperCase();
+              if (arpMac == targetMac) {
+                targetIp = arp['address']?.toString();
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          // ignore errors
+        }
+      }
       
+      if (targetIp == null || (targetIp == target.split('/')[0].trim() && isMacAddress)) {
+        return null;
+      }
+      
+      // استفاده از timeout برای جلوگیری از لود طولانی
+      // اگر timeout 发生،返回 null 而不是抛出异常
+      List<Map<String, String>> queues;
+      try {
+        queues = await _client!.talk(['/queue/simple/print'])
+            .timeout(const Duration(seconds: 10), onTimeout: () {
+              print('⚠️ [GET_SPEED] Timeout در دریافت queue ها برای IP: $targetIp');
+              return <Map<String, String>>[]; // 返回空列表而不是抛出异常
+            });
+      } catch (e) {
+        print('⚠️ [GET_SPEED] خطا در دریافت queue ها: $e');
+        return null; // 如果出错，返回 null
+      }
+      
+      final targetIpClean = targetIp.split('/')[0].trim();
+      final targetWithSubnet = targetIp.contains('/') ? targetIp : '$targetIp/32';
+      final expectedQueueName = 'DEV-$targetIpClean'; // نام queue که قبلاً ایجاد شده: DEV-192.168.88.50
+      
+      print('🔧 [GET_SPEED] جستجوی queue برای IP: $targetIpClean (نام مورد انتظار: $expectedQueueName)');
+      print('🔧 [GET_SPEED] تعداد queue های دریافتی: ${queues.length}');
+      
+      // جستجوی queue - از طریق target یا name
+      // وقتی اولین queue مطابقت پیدا کرد، فوراً return کن
       for (var queue in queues) {
         final queueTarget = queue['target']?.toString() ?? '';
-        if (queueTarget.isEmpty) continue;
+        final queueName = queue['name']?.toString() ?? '';
         
-        // استخراج IP از target (ممکن است به صورت 192.168.88.252/32 باشد)
-        final queueTargetIp = queueTarget.split('/')[0].trim();
+        // روش 1: بررسی از طریق target
+        bool targetMatches = false;
+        if (queueTarget.isNotEmpty) {
+          // استخراج IP از target (ممکن است به صورت 192.168.88.252/32 باشد)
+          final queueTargetIp = queueTarget.split('/')[0].trim();
+          
+          // مقایسه IP ها (با در نظر گرفتن /32)
+          targetMatches = queueTargetIp == targetIpClean || 
+                          queueTarget == targetIp || 
+                          queueTarget == targetWithSubnet ||
+                          queueTarget.startsWith('$targetIpClean/') ||
+                          queueTargetIp == targetIp;
+        }
         
-        // مقایسه IP ها (با در نظر گرفتن /32)
-        if (queueTargetIp == targetIp || 
-            queueTarget == target || 
-            queueTarget.startsWith('$targetIp/') ||
-            queueTargetIp == target) {
+        // روش 2: بررسی از طریق name (فرمت: DEV-192.168.88.50)
+        bool nameMatches = false;
+        if (queueName.isNotEmpty) {
+          // بررسی اینکه name با "DEV-" شروع می‌شود و IP را شامل می‌شود
+          if (queueName == expectedQueueName || 
+              queueName.contains(targetIpClean) ||
+              queueName == 'DEV-${targetIpClean.replaceAll('.', '-')}') {
+            nameMatches = true;
+          }
+        }
+        
+        // اگر target یا name مطابقت داشت
+        if (targetMatches || nameMatches) {
+          print('✅ [GET_SPEED] Queue پیدا شد - Target: $queueTarget, Name: $queueName');
           final maxLimit = queue['max-limit']?.toString() ?? '';
           
-          // تبدیل از بیت به فرمت M/K
-          // در MikroTik، max-limit به بیت بر ثانیه است (نه بایت)
-          // مثال: 2000000 = 2 Mbps, 1000000 = 1 Mbps
+          // بررسی اینکه max-limit موجود است
+          if (maxLimit.isEmpty || maxLimit == 'N/A' || maxLimit == '0/0') {
+            print('⚠️ [GET_SPEED] Queue پیدا شد اما max-limit معتبر نیست: $maxLimit');
+            continue; // به queue بعدی برو
+          }
+          
+          // تبدیل از بیت به فرمت M/K (اگر لازم باشد)
+          // RouterOS v6 ممکن است از قبل M/K 格式返回 دهد (مانند "8M/8M")
+          // یا ممکن است بیت格式 باشد (مانند "8000000/8000000")
           String formattedMaxLimit = maxLimit;
           if (maxLimit.isNotEmpty && maxLimit != 'N/A' && maxLimit.contains('/')) {
             final parts = maxLimit.split('/');
             if (parts.length == 2) {
-              try {
-                // مقدار به بیت بر ثانیه است
-                final uploadBits = int.tryParse(parts[0].trim()) ?? 0;
-                final downloadBits = int.tryParse(parts[1].trim()) ?? 0;
+              final uploadPart = parts[0].trim();
+              final downloadPart = parts[1].trim();
+              
+              // بررسی اینکه آیا از قبل M/K 格式 است
+              final uploadHasUnit = RegExp(r'^(\d+)([KMkm])$').hasMatch(uploadPart);
+              final downloadHasUnit = RegExp(r'^(\d+)([KMkm])$').hasMatch(downloadPart);
+              
+              // اگر از قبل M/K 格式 است، بدون تغییر برگردان
+              if (uploadHasUnit && downloadHasUnit) {
+                print('✅ [GET_SPEED] max-limit از قبل M/K 格式 است: $maxLimit');
+                formattedMaxLimit = maxLimit; // 不需要转换
+              } else {
+                // اگر بیت格式 است،转换为 M/K
+                try {
+                  // مقدار به بیت بر ثانیه است
+                  final uploadBits = int.tryParse(uploadPart) ?? 0;
+                  final downloadBits = int.tryParse(downloadPart) ?? 0;
                 
                 // تبدیل به Mbps (1 Mbps = 1,000,000 bits)
                 final uploadMbps = uploadBits / 1000000;
@@ -1564,8 +1894,10 @@ class MikroTikService {
                 }
                 
                 formattedMaxLimit = '$uploadFormatted/$downloadFormatted';
-              } catch (e) {
-                // اگر تبدیل نشد، همان مقدار اصلی را نگه دار
+                } catch (e) {
+                  // اگر تبدیل نشد، همان مقدار اصلی را نگه دار
+                  formattedMaxLimit = maxLimit;
+                }
               }
             }
           }
@@ -1578,8 +1910,16 @@ class MikroTikService {
           };
         }
       }
+      
       return null;
     } catch (e) {
+      // 如果已经处理了 timeout，不要再次抛出异常
+      final errorStr = e.toString().toLowerCase();
+      if (errorStr.contains('timeout')) {
+        print('⚠️ [GET_SPEED] Timeout در دریافت سرعت: $e');
+        return null;
+      }
+      print('❌ [GET_SPEED] خطا در دریافت سرعت: $e');
       throw Exception('خطا در دریافت سرعت: $e');
     }
   }
@@ -2865,524 +3205,6 @@ class MikroTikService {
       return result;
     } catch (e) {
       throw Exception('خطا در بررسی IP: $e');
-    }
-  }
-
-  /// ایجاد یا به‌روزرسانی Static IP Lease
-  /// این تابع یک Static DHCP lease ایجاد می‌کند تا دستگاه همیشه همان IP را بگیرد
-  /// این برای شناسایی بهتر دستگاه در آینده مفید است
-  Future<void> _createOrUpdateStaticLease(
-    String ipAddress,
-    String macAddress, {
-    String? hostname,
-    String? comment,
-  }) async {
-    if (_client == null || !isConnected) {
-      return;
-    }
-
-    try {
-      // بررسی اینکه آیا Static lease قبلاً وجود دارد
-      final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-      String? existingLeaseId;
-      
-      for (var lease in dhcpLeases) {
-        final leaseMac = lease['mac-address']?.toString().toUpperCase();
-        final leaseIp = lease['address']?.toString();
-        
-        // اگر MAC یا IP مطابقت دارد
-        if (leaseMac == macAddress.toUpperCase() || leaseIp == ipAddress) {
-          existingLeaseId = lease['.id'];
-          break;
-        }
-      }
-
-      final staticComment = comment ?? 'Static IP via Flutter App';
-      final leaseCommand = <String>[
-        '=address=$ipAddress',
-        '=mac-address=$macAddress',
-        '=comment=$staticComment',
-      ];
-
-      if (hostname != null && hostname.isNotEmpty) {
-        leaseCommand.add('=host-name=$hostname');
-      }
-
-      if (existingLeaseId != null) {
-        // به‌روزرسانی lease موجود
-        leaseCommand.insert(0, '/ip/dhcp-server/lease/set');
-        leaseCommand.insert(1, '=.id=$existingLeaseId');
-        await _client!.talk(leaseCommand);
-      } else {
-        // ایجاد lease جدید
-        leaseCommand.insert(0, '/ip/dhcp-server/lease/add');
-        await _client!.talk(leaseCommand);
-      }
-    } catch (e) {
-      // ignore errors - Static IP optional است
-    }
-  }
-
-  /// بررسی اینکه آیا DHCP lease دستگاه static است یا نه
-  /// این متد از IP، MAC و hostname برای شناسایی استفاده می‌کند
-  /// این برای حالتی است که MAC Address تغییر کرده باشد (مثلاً Private MAC در iOS)
-  Future<bool> isDeviceStatic(String? ipAddress, String? macAddress, {String? hostname}) async {
-    print('[STATIC] MikroTikService.isDeviceStatic: شروع');
-    print('[STATIC] IP: $ipAddress, MAC: $macAddress, hostname: $hostname');
-    print('[STATIC] isConnected: $isConnected, _client: ${_client != null}');
-    
-    if (_client == null || !isConnected) {
-      print('[STATIC] MikroTikService.isDeviceStatic: اتصال برقرار نیست');
-      return false;
-    }
-
-    if (ipAddress == null && macAddress == null && hostname == null) {
-      print('[STATIC] MikroTikService.isDeviceStatic: IP، MAC و hostname همه null هستند');
-      return false;
-    }
-
-    try {
-      print('[STATIC] MikroTikService.isDeviceStatic: دریافت لیست DHCP leases');
-      final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-      print('[STATIC] MikroTikService.isDeviceStatic: تعداد leases: ${dhcpLeases.length}');
-      
-      for (var lease in dhcpLeases) {
-        final leaseMac = lease['mac-address']?.toString().toUpperCase();
-        final leaseIp = lease['address']?.toString();
-        final leaseHostname = lease['host-name']?.toString();
-        final isStatic = lease['dynamic']?.toString().toLowerCase() == 'false';
-        final leaseId = lease['.id'];
-        final leaseComment = lease['comment']?.toString() ?? '';
-
-        print('[STATIC] بررسی lease: ID=$leaseId, IP=$leaseIp, MAC=$leaseMac, Hostname=$leaseHostname, isStatic=$isStatic');
-
-        // اولویت 1: بررسی تطابق MAC (اگر MAC تغییر نکرده باشد)
-        if (macAddress != null && leaseMac == macAddress.toUpperCase() && isStatic) {
-          print('[STATIC] MikroTikService.isDeviceStatic: تطابق MAC پیدا شد! نتیجه: $isStatic');
-          return true;
-        }
-        
-        // اولویت 2: بررسی تطابق IP (اگر IP ثابت باشد)
-        if (ipAddress != null && leaseIp == ipAddress && isStatic) {
-          print('[STATIC] MikroTikService.isDeviceStatic: تطابق IP پیدا شد! نتیجه: $isStatic');
-          return true;
-        }
-        
-        // اولویت 3: بررسی تطابق hostname (برای حالتی که MAC تغییر کرده)
-        // این مهم است برای iOS/Android که Private MAC Address دارند
-        if (hostname != null && 
-            hostname.isNotEmpty && 
-            leaseHostname != null && 
-            leaseHostname.isNotEmpty &&
-            leaseHostname.toLowerCase().trim() == hostname.toLowerCase().trim() &&
-            isStatic &&
-            leaseComment.contains('Static Device')) {
-          print('[STATIC] MikroTikService.isDeviceStatic: تطابق hostname پیدا شد! نتیجه: $isStatic');
-          print('[STATIC] MAC ممکن است تغییر کرده باشد اما hostname یکسان است');
-          return true;
-        }
-      }
-      
-      print('[STATIC] MikroTikService.isDeviceStatic: هیچ lease مطابق پیدا نشد');
-      return false;
-    } catch (e) {
-      print('[STATIC] MikroTikService.isDeviceStatic: خطا: $e');
-      print('[STATIC] Stack trace: ${StackTrace.current}');
-      return false;
-    }
-  }
-
-  /// تبدیل دستگاه به static یا non-static
-  /// وقتی static می‌شود: به لیست مجاز اضافه می‌شود (Access List، Static Lease)
-  /// وقتی non-static می‌شود: از همه جا حذف می‌شود (Access List، Static Lease حذف می‌شود)
-  Future<bool> setDeviceStaticStatus(
-    String ipAddress,
-    String? macAddress, {
-    String? hostname,
-    bool isStatic = true,
-  }) async {
-    print('[STATIC] MikroTikService.setDeviceStaticStatus: شروع');
-    print('[STATIC] IP: $ipAddress, MAC: $macAddress, hostname: $hostname, isStatic: $isStatic');
-    print('[STATIC] isConnected: $isConnected, _client: ${_client != null}');
-    
-    if (_client == null || !isConnected) {
-      print('[STATIC] MikroTikService.setDeviceStaticStatus: اتصال برقرار نیست');
-      throw Exception('اتصال برقرار نشده');
-    }
-
-    try {
-      // پیدا کردن MAC address از IP اگر داده نشده باشد
-      String? macToUse = macAddress;
-      print('[STATIC] MAC اولیه: $macToUse');
-      if (macToUse == null) {
-        print('[STATIC] MAC null است، جستجو در DHCP leases...');
-        try {
-          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-          for (var lease in dhcpLeases) {
-            if (lease['address']?.toString() == ipAddress) {
-              macToUse = lease['mac-address']?.toString();
-              break;
-            }
-          }
-
-          if (macToUse == null) {
-            print('[STATIC] MAC در DHCP پیدا نشد، جستجو در ARP table...');
-            final arpEntries = await _client!.talk(['/ip/arp/print']);
-            for (var arp in arpEntries) {
-              if (arp['address']?.toString() == ipAddress) {
-                macToUse = arp['mac-address']?.toString();
-                print('[STATIC] MAC در ARP پیدا شد: $macToUse');
-                break;
-              }
-            }
-          }
-        } catch (e) {
-          print('[STATIC] خطا در جستجوی MAC: $e');
-        }
-      }
-
-      if (macToUse == null) {
-        print('[STATIC] MAC address پیدا نشد!');
-        throw Exception('MAC address پیدا نشد');
-      }
-
-      print('[STATIC] MAC نهایی استفاده شده: $macToUse');
-
-      if (isStatic) {
-        print('[STATIC] تبدیل به Static: شروع فرایند');
-        // تبدیل به static: اضافه کردن به لیست مجاز
-
-        // 1. تبدیل DHCP lease به static
-        try {
-          print('[STATIC] مرحله 1: بررسی و تبدیل DHCP lease به static');
-          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-          print('[STATIC] تعداد DHCP leases: ${dhcpLeases.length}');
-          String? leaseId;
-          for (var lease in dhcpLeases) {
-            final leaseMac = lease['mac-address']?.toString().toUpperCase();
-            final leaseIp = lease['address']?.toString();
-            print('[STATIC] بررسی lease: IP=$leaseIp, MAC=$leaseMac');
-            if (leaseMac == macToUse.toUpperCase() || leaseIp == ipAddress) {
-              leaseId = lease['.id'];
-              print('[STATIC] Lease مطابق پیدا شد: ID=$leaseId');
-              break;
-            }
-          }
-
-          if (leaseId != null) {
-            print('[STATIC] تبدیل lease موجود به static: ID=$leaseId');
-            // تبدیل به static lease
-            try {
-              await _client!.talk([
-                '/ip/dhcp-server/lease/make-static',
-                '=.id=$leaseId',
-              ]);
-              print('[STATIC] Lease با موفقیت به static تبدیل شد');
-            } catch (e) {
-              print('[STATIC] خطا در تبدیل lease به static (ممکن است قبلاً static باشد): $e');
-            }
-          } else {
-            print('[STATIC] Lease موجود نیست، بررسی با hostname...');
-            
-            // اگر lease با MAC پیدا نشد، با hostname جستجو کن
-            // این برای حالتی است که MAC تغییر کرده باشد
-            String? existingLeaseByHostname;
-            if (hostname != null && hostname.isNotEmpty) {
-              for (var lease in dhcpLeases) {
-                final leaseHostname = lease['host-name']?.toString();
-                final leaseComment = lease['comment']?.toString() ?? '';
-                final isStatic = lease['dynamic']?.toString().toLowerCase() == 'false';
-                
-                if (leaseHostname != null && 
-                    leaseHostname.isNotEmpty &&
-                    leaseHostname.toLowerCase().trim() == hostname.toLowerCase().trim() &&
-                    isStatic &&
-                    leaseComment.contains('Static Device')) {
-                  existingLeaseByHostname = lease['.id'];
-                  print('[STATIC] Lease با hostname پیدا شد: ID=$existingLeaseByHostname');
-                  // به‌روزرسانی MAC در lease موجود
-                  if (existingLeaseByHostname != null) {
-                    try {
-                      await _client!.talk([
-                        '/ip/dhcp-server/lease/set',
-                        '=.id=$existingLeaseByHostname',
-                        '=mac-address=$macToUse',
-                        '=address=$ipAddress',
-                      ]);
-                      print('[STATIC] MAC و IP در lease موجود به‌روزرسانی شد');
-                      break;
-                    } catch (e) {
-                      print('[STATIC] خطا در به‌روزرسانی lease: $e');
-                    }
-                  }
-                }
-              }
-            }
-            
-            // اگر با hostname هم پیدا نشد، یک static lease جدید ایجاد کن
-            if (existingLeaseByHostname == null) {
-              print('[STATIC] ایجاد static lease جدید');
-              await _createOrUpdateStaticLease(
-                ipAddress,
-                macToUse,
-                hostname: hostname,
-                comment: 'Static Device - Lock Allowed',
-              );
-              print('[STATIC] Static lease جدید ایجاد شد');
-            }
-          }
-        } catch (e) {
-          print('[STATIC] خطا در تبدیل DHCP lease (DHCP ممکن است فعال نباشد): $e');
-        }
-
-        // 2. اضافه کردن به Wireless Access List (اگر wireless است)
-        try {
-          print('[STATIC] مرحله 2: اضافه کردن به Wireless Access List');
-          final wirelessInterfaces = await _client!.talk(['/interface/wireless/print']);
-          print('[STATIC] تعداد wireless interfaces: ${wirelessInterfaces.length}');
-          for (var wifiInterface in wirelessInterfaces) {
-            final interfaceName = wifiInterface['name']?.toString();
-            print('[STATIC] بررسی interface: $interfaceName');
-            if (interfaceName != null) {
-              // بررسی اینکه آیا قبلاً اضافه شده
-              bool exists = false;
-              final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
-              print('[STATIC] تعداد access list entries: ${accessList.length}');
-              for (var acl in accessList) {
-                if (acl['mac-address']?.toString().toUpperCase() == macToUse.toUpperCase() &&
-                    acl['interface']?.toString() == interfaceName) {
-                  exists = true;
-                  print('[STATIC] Access list entry موجود است: ${acl['.id']}');
-                  // اگر action allow نیست، تغییر بده
-                  if (acl['action']?.toString() != 'allow') {
-                    final aclId = acl['.id'];
-                    print('[STATIC] تغییر action به allow: ID=$aclId');
-                    if (aclId != null) {
-                      await _client!.talk([
-                        '/interface/wireless/access-list/set',
-                        '=.id=$aclId',
-                        '=action=allow',
-                        '=comment=Static Device - Lock Allowed',
-                      ]);
-                      print('[STATIC] Action با موفقیت تغییر کرد');
-                    }
-                  }
-                  break;
-                }
-              }
-
-              // اگر وجود ندارد، اضافه کن
-              if (!exists) {
-                print('[STATIC] اضافه کردن access list entry جدید');
-                await _client!.talk([
-                  '/interface/wireless/access-list/add',
-                  '=interface=$interfaceName',
-                  '=mac-address=$macToUse',
-                  '=action=allow',
-                  '=comment=Static Device - Lock Allowed',
-                ]);
-                print('[STATIC] Access list entry با موفقیت اضافه شد');
-              }
-            }
-          }
-        } catch (e) {
-          print('[STATIC] خطا در اضافه کردن به Wireless Access List (wireless ممکن است فعال نباشد): $e');
-        }
-
-        // 3. اضافه کردن به لیست مجاز در SharedPreferences
-        try {
-          print('[STATIC] مرحله 3: اضافه کردن به SharedPreferences');
-          final prefs = await SharedPreferences.getInstance();
-          final allowedMacsList = prefs.getStringList('locked_allowed_macs') ?? [];
-          final macUpper = macToUse.toUpperCase();
-          if (!allowedMacsList.contains(macUpper)) {
-            allowedMacsList.add(macUpper);
-            await prefs.setStringList('locked_allowed_macs', allowedMacsList);
-            print('[STATIC] MAC به لیست مجاز اضافه شد: $macUpper');
-          } else {
-            print('[STATIC] MAC قبلاً در لیست مجاز بود');
-          }
-
-          final allowedIpsList = prefs.getStringList('locked_allowed_ips') ?? [];
-          if (!allowedIpsList.contains(ipAddress)) {
-            allowedIpsList.add(ipAddress);
-            await prefs.setStringList('locked_allowed_ips', allowedIpsList);
-            print('[STATIC] IP به لیست مجاز اضافه شد: $ipAddress');
-          } else {
-            print('[STATIC] IP قبلاً در لیست مجاز بود');
-          }
-        } catch (e) {
-          print('[STATIC] خطا در اضافه کردن به SharedPreferences: $e');
-        }
-        
-        print('[STATIC] تبدیل به Static با موفقیت انجام شد');
-      } else {
-        print('[STATIC] تبدیل به غیر Static: شروع فرایند');
-        // تبدیل به non-static: حذف از همه جا
-
-        // 1. حذف Static DHCP lease (تبدیل به dynamic با حذف lease)
-        try {
-          final dhcpLeases = await _client!.talk(['/ip/dhcp-server/lease/print']);
-          for (var lease in dhcpLeases) {
-            final leaseMac = lease['mac-address']?.toString().toUpperCase();
-            final leaseIp = lease['address']?.toString();
-            final isStatic = lease['dynamic']?.toString().toLowerCase() == 'false';
-
-            if (isStatic && (leaseMac == macToUse.toUpperCase() || leaseIp == ipAddress)) {
-              final leaseId = lease['.id'];
-              if (leaseId != null) {
-                // حذف static lease (تبدیل به dynamic)
-                try {
-                  await _client!.talk([
-                    '/ip/dhcp-server/lease/remove',
-                    '=.id=$leaseId',
-                  ]);
-                } catch (e) {
-                  // ignore
-                }
-              }
-            }
-          }
-        } catch (e) {
-          // ignore - DHCP ممکن است فعال نباشد
-        }
-
-        // 2. حذف از Wireless Access List
-        // حذف همه rule های access list که مربوط به این MAC هستند و action=allow دارند
-        // (rule های ban با action=deny/reject را نگه داریم)
-        try {
-          print('[STATIC] مرحله 2: حذف از Wireless Access List');
-          final accessList = await _client!.talk(['/interface/wireless/access-list/print']);
-          print('[STATIC] تعداد access list entries: ${accessList.length}');
-          for (var acl in accessList) {
-            final aclMac = acl['mac-address']?.toString().toUpperCase();
-            final aclAction = acl['action']?.toString();
-            final aclComment = acl['comment']?.toString() ?? '';
-            final aclId = acl['.id'];
-            
-            print('[STATIC] بررسی ACL: ID=$aclId, MAC=$aclMac, Action=$aclAction, Comment=$aclComment');
-            
-            // اگر MAC مطابقت دارد و action=allow است، حذف کن
-            // همچنین rule هایی با comment مربوط به static/lock را هم حذف کن
-            // اما rule های ban (action=deny/reject بدون comment مربوط به lock) را نگه دار
-            if (aclMac == macToUse.toUpperCase() && 
-                (aclAction == 'allow' || 
-                 aclComment == 'Static Device - Lock Allowed' ||
-                 aclComment == 'Lock New Connections - Allowed Device')) {
-              print('[STATIC] ACL مطابق پیدا شد، حذف می‌کنم: ID=$aclId');
-              if (aclId != null) {
-                try {
-                  await _client!.talk([
-                    '/interface/wireless/access-list/remove',
-                    '=.id=$aclId',
-                  ]);
-                  print('[STATIC] ACL با موفقیت حذف شد');
-                } catch (e) {
-                  print('[STATIC] خطا در حذف ACL: $e');
-                }
-              }
-            }
-          }
-        } catch (e) {
-          print('[STATIC] خطا در حذف از Wireless Access List (wireless ممکن است فعال نباشد): $e');
-        }
-
-        // 3. حذف Static ARP entries (اگر وجود داشته باشد)
-        try {
-          print('[STATIC] مرحله 3: حذف Static ARP entries');
-          final arpEntries = await _client!.talk(['/ip/arp/print']);
-          print('[STATIC] تعداد ARP entries: ${arpEntries.length}');
-          for (var arp in arpEntries) {
-            final arpMac = arp['mac-address']?.toString().toUpperCase();
-            final arpIp = arp['address']?.toString();
-            final isStatic = arp['dynamic']?.toString().toLowerCase() == 'false';
-            final arpId = arp['.id'];
-
-            print('[STATIC] بررسی ARP: ID=$arpId, IP=$arpIp, MAC=$arpMac, isStatic=$isStatic');
-
-            if (isStatic && (arpMac == macToUse.toUpperCase() || arpIp == ipAddress)) {
-              print('[STATIC] Static ARP entry مطابق پیدا شد، حذف می‌کنم: ID=$arpId');
-              if (arpId != null) {
-                try {
-                  await _client!.talk([
-                    '/ip/arp/remove',
-                    '=.id=$arpId',
-                  ]);
-                  print('[STATIC] ARP entry با موفقیت حذف شد');
-                } catch (e) {
-                  print('[STATIC] خطا در حذف ARP entry: $e');
-                }
-              }
-            }
-          }
-        } catch (e) {
-          print('[STATIC] خطا در حذف Static ARP entries (ARP ممکن است فعال نباشد): $e');
-        }
-
-        // 4. حذف Simple Queue rules (اگر وجود داشته باشد)
-        try {
-          print('[STATIC] مرحله 4: حذف Simple Queue rules');
-          final queues = await _client!.talk(['/queue/simple/print']);
-          print('[STATIC] تعداد queues: ${queues.length}');
-          for (var queue in queues) {
-            final queueTarget = queue['target']?.toString();
-            final queueDst = queue['dst']?.toString();
-            final queueComment = queue['comment']?.toString() ?? '';
-            final queueId = queue['.id'];
-
-            print('[STATIC] بررسی queue: ID=$queueId, Target=$queueTarget, Dst=$queueDst, Comment=$queueComment');
-
-            // اگر IP یا MAC در target/dst است و comment مربوط به static/lock است، حذف کن
-            if ((queueTarget == ipAddress || queueTarget == macToUse ||
-                 queueDst == ipAddress || queueDst == macToUse) &&
-                (queueComment.contains('Static Device') || 
-                 queueComment.contains('Lock Allowed'))) {
-              print('[STATIC] Queue مطابق پیدا شد، حذف می‌کنم: ID=$queueId');
-              if (queueId != null) {
-                try {
-                  await _client!.talk([
-                    '/queue/simple/remove',
-                    '=.id=$queueId',
-                  ]);
-                  print('[STATIC] Queue با موفقیت حذف شد');
-                } catch (e) {
-                  print('[STATIC] خطا در حذف queue: $e');
-                }
-              }
-            }
-          }
-        } catch (e) {
-          print('[STATIC] خطا در حذف Simple Queue rules (Queue ممکن است فعال نباشد): $e');
-        }
-
-        // 5. قطع Connection Tracking entries (برای قطع اتصال فوری)
-        // توجه: Connection entries خودکار expire می‌شوند، اما برای قطع فوری، از firewall drop استفاده می‌کنیم
-        // در MikroTik، نمی‌توان connection entries را مستقیماً حذف کرد، اما با حذف rule های allow
-        // و حذف DHCP lease، اتصال قطع می‌شود
-
-        // 6. حذف از لیست مجاز در SharedPreferences
-        try {
-          final prefs = await SharedPreferences.getInstance();
-          final allowedMacsList = prefs.getStringList('locked_allowed_macs') ?? [];
-          final macUpper = macToUse.toUpperCase();
-          if (allowedMacsList.contains(macUpper)) {
-            allowedMacsList.remove(macUpper);
-            await prefs.setStringList('locked_allowed_macs', allowedMacsList);
-          }
-
-          final allowedIpsList = prefs.getStringList('locked_allowed_ips') ?? [];
-          if (allowedIpsList.contains(ipAddress)) {
-            allowedIpsList.remove(ipAddress);
-            await prefs.setStringList('locked_allowed_ips', allowedIpsList);
-          }
-        } catch (e) {
-          // ignore - SharedPreferences optional است
-        }
-      }
-
-      return true;
-    } catch (e) {
-      throw Exception('خطا در تبدیل دستگاه: $e');
     }
   }
 
@@ -7204,7 +7026,6 @@ class MikroTikService {
           results['mangle_rule'] = 'created';
         } else {
           results['mangle_rule'] = 'already_exists';
-          print('[Telegram Filter] Mangle Rule از قبل وجود دارد، اضافه نشد');
         }
       } catch (e) {
         errors.add('خطا در ایجاد Mangle Rule: $e');
@@ -7316,17 +7137,13 @@ class MikroTikService {
           }
         }
       } catch (e) {
-        print('[Telegram Filter] خطا در حذف RAW Rule: $e');
+        // ignore errors
       }
 
       // 2. حذف Mangle Rules مربوط به Telegram detection
       // بررسی دقیق بر اساس tls-host و سایر فیلدهای مهم (بدون توجه به addressList که ممکن است خالی باشد)
       try {
-        print('[Telegram Filter] ========== شروع حذف Mangle Rules ==========');
         final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
-        print('[Telegram Filter] تعداد کل Mangle Rules موجود: ${allMangleRules.length}');
-        
-        int mangleRemovedCount = 0;
         
         for (final rule in allMangleRules) {
           final dstList = rule['dst-address-list']?.toString() ?? '';
@@ -7351,37 +7168,26 @@ class MikroTikService {
           }
           
           if (isTelegramRule) {
-            print('[Telegram Filter]   Rule پیدا شد برای حذف - ID: $ruleId');
-            print('[Telegram Filter]     dst-address-list: "$dstList"');
-            print('[Telegram Filter]     action: "$action"');
-            print('[Telegram Filter]     comment: "$comment"');
-            
             if (ruleId.isNotEmpty) {
               try {
                 await _client!.talk([
                   '/ip/firewall/mangle/remove',
                   '=.id=$ruleId',
                 ]);
-                mangleRemovedCount++;
                 removedCount++;
-                print('[Telegram Filter]   ✓ Mangle Rule حذف شد: $ruleId');
               } catch (e) {
-                print('[Telegram Filter]   ✗ خطا در حذف Mangle Rule $ruleId: $e');
+                // ignore errors
               }
             }
           }
         }
-        
-        print('[Telegram Filter] تعداد Mangle Rules حذف شده: $mangleRemovedCount');
-        print('[Telegram Filter] ========== پایان حذف Mangle Rules ==========');
       } catch (e) {
-        print('[Telegram Filter] خطا در حذف Mangle Rules: $e');
+        // ignore errors
       }
 
       // 3. حذف Address List entries مربوط به Telegram
       try {
         final allAddressList = await _client!.talk(['/ip/firewall/address-list/print']);
-        int addressListRemoved = 0;
         
         for (final entry in allAddressList) {
           final list = entry['list']?.toString() ?? '';
@@ -7394,19 +7200,14 @@ class MikroTikService {
                   '/ip/firewall/address-list/remove',
                   '=.id=$entryId',
                 ]);
-                addressListRemoved++;
               } catch (e) {
-                print('[Telegram Filter] خطا در حذف Address List entry $entryId: $e');
+                // ignore errors
               }
             }
           }
         }
-        
-        if (addressListRemoved > 0) {
-          print('[Telegram Filter] $addressListRemoved Address List entries حذف شدند از $addressListName');
-        }
       } catch (e) {
-        print('[Telegram Filter] خطا در حذف Address List entries: $e');
+        // ignore errors
       }
 
       return removedCount > 0;
@@ -7545,10 +7346,8 @@ class MikroTikService {
               ]);
               tlsHostRulesCount++;
             } catch (e) {
-              print('[YouTube Filter] خطا در ایجاد TLS Host Detection rule برای $domain: $e');
+              // ignore errors
             }
-          } else {
-            print('[YouTube Filter] Filter Rule از قبل وجود دارد برای $domain، اضافه نشد');
           }
         }
         results['tls_host_detection_rules'] = tlsHostRulesCount;
@@ -7667,11 +7466,7 @@ class MikroTikService {
 
       // 2. حذف Mangle Rules مربوط به YouTube (mark-routing)
       try {
-        print('[YouTube Filter] ========== شروع حذف Mangle Rules ==========');
         final allMangleRules = await _client!.talk(['/ip/firewall/mangle/print']);
-        print('[YouTube Filter] تعداد کل Mangle Rules موجود: ${allMangleRules.length}');
-        
-        int mangleRemovedCount = 0;
         
         for (final rule in allMangleRules) {
           final dstList = rule['dst-address-list']?.toString() ?? '';
@@ -7696,41 +7491,28 @@ class MikroTikService {
           }
           
           if (isYouTubeRule) {
-            print('[YouTube Filter]   Rule پیدا شد برای حذف - ID: $ruleId');
-            print('[YouTube Filter]     dst-address-list: "$dstList"');
-            print('[YouTube Filter]     action: "$action"');
-            print('[YouTube Filter]     comment: "$comment"');
-            
             if (ruleId.isNotEmpty) {
               try {
                 await _client!.talk([
                   '/ip/firewall/mangle/remove',
                   '=.id=$ruleId',
                 ]);
-                mangleRemovedCount++;
                 removedCount++;
-                print('[YouTube Filter]   ✓ Mangle Rule حذف شد: $ruleId');
               } catch (e) {
-                print('[YouTube Filter]   ✗ خطا در حذف Mangle Rule $ruleId: $e');
+                // ignore errors
               }
             }
           }
         }
-        
-        print('[YouTube Filter] تعداد Mangle Rules حذف شده: $mangleRemovedCount');
-        print('[YouTube Filter] ========== پایان حذف Mangle Rules ==========');
       } catch (e) {
-        print('[YouTube Filter] خطا در حذف Mangle Rules: $e');
+        // ignore errors
       }
 
       // 3. حذف TLS Host Detection Rules (Filter Rules)
       try {
-        print('[YouTube Filter] ========== شروع حذف TLS Host Detection Rules ==========');
         final allFilterRules = await _client!.talk(['/ip/firewall/filter/print']);
-        print('[YouTube Filter] تعداد کل Filter Rules موجود: ${allFilterRules.length}');
         
         final youtubeDomains = ['*youtube*', '*ytimg*', '*googlevideo*', '*ggpht*'];
-        int filterRemovedCount = 0;
         
         for (final rule in allFilterRules) {
           final tlsHost = rule['tls-host']?.toString() ?? '';
@@ -7763,32 +7545,21 @@ class MikroTikService {
           }
           
           if (isYouTubeRule) {
-            print('[YouTube Filter]   Rule پیدا شد برای حذف - ID: $ruleId');
-            print('[YouTube Filter]     tls-host: "$tlsHost"');
-            print('[YouTube Filter]     action: "$action"');
-            print('[YouTube Filter]     dst-address-list: "$addressList"');
-            print('[YouTube Filter]     comment: "$comment"');
-            
             if (ruleId.isNotEmpty) {
               try {
                 await _client!.talk([
                   '/ip/firewall/filter/remove',
                   '=.id=$ruleId',
                 ]);
-                filterRemovedCount++;
                 removedCount++;
-                print('[YouTube Filter]   ✓ TLS Host Detection Rule حذف شد: $ruleId');
               } catch (e) {
-                print('[YouTube Filter]   ✗ خطا در حذف TLS Host Detection Rule $ruleId: $e');
+                // ignore errors
               }
             }
           }
         }
-        
-        print('[YouTube Filter] تعداد TLS Host Detection Rules حذف شده: $filterRemovedCount');
-        print('[YouTube Filter] ========== پایان حذف TLS Host Detection Rules ==========');
       } catch (e) {
-        print('[YouTube Filter] خطا در حذف TLS Host Detection Rules: $e');
+        // ignore errors
       }
 
       // 4. حذف Address List entries مربوط به YouTube
@@ -9177,7 +8948,6 @@ class MikroTikService {
                 try {
                   await _client!.talk(['/ip/firewall/raw/remove', '=.id=$ruleId']);
                   removedCount++;
-                  print('[DEBUG] disablePlatformFilter: Removed QUIC Raw Rule for telegram: $ruleId');
                 } catch (e) {
                   // continue
                 }
@@ -9186,7 +8956,6 @@ class MikroTikService {
           }
         }
       } catch (e) {
-        print('[DEBUG] disablePlatformFilter: Error removing Raw Rules: $e');
         // continue
       }
 
@@ -9341,6 +9110,705 @@ class MikroTikService {
       return removedCount > 0;
     } catch (e) {
       throw Exception('خطا در غیرفعال‌سازی فیلتر پلتفرم: $e');
+    }
+  }
+
+  /// تبدیل Dynamic DHCP Lease به Static Lease
+  /// مشابه POST /api/dhcp/make-static در پروژه Python
+  /// 
+  /// این متد یک Dynamic Lease را پیدا می‌کند و آن را به Static تبدیل می‌کند.
+  /// Static Lease یعنی IP address همیشه یکسان است و expire نمی‌شود.
+  /// 
+  /// مزایا:
+  /// - IP address ثابت می‌ماند
+  /// - Hostname ثابت می‌ماند
+  /// - شناسایی دستگاه آسان‌تر می‌شود
+  /// - برای Ban بهتر است
+  Future<Map<String, dynamic>> makeStaticLease({
+    required String? macAddress,
+    required String? ipAddress,
+    String? hostname,
+    String? comment,
+  }) async {
+    print('═══════════════════════════════════════════════════════════');
+    print('🔧 [STATIC_LEASE] شروع فرآیند تبدیل به Static Lease');
+    print('🔧 [STATIC_LEASE] MAC Address: ${macAddress ?? "N/A"}');
+    print('🔧 [STATIC_LEASE] IP Address: ${ipAddress ?? "N/A"}');
+    print('🔧 [STATIC_LEASE] Hostname: ${hostname ?? "N/A"}');
+    print('🔧 [STATIC_LEASE] Comment: ${comment ?? "N/A"}');
+    print('═══════════════════════════════════════════════════════════');
+
+    if (_client == null || !isConnected) {
+      print('❌ [STATIC_LEASE] خطا: اتصال برقرار نشده');
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (macAddress == null && ipAddress == null) {
+      print('❌ [STATIC_LEASE] خطا: باید MAC address یا IP address را وارد کنید');
+      throw Exception('باید MAC address یا IP address را وارد کنید');
+    }
+
+    try {
+      // مرحله 1: دریافت لیست Leases (با تلاش برای استفاده از فیلتر)
+      print('📋 [STATIC_LEASE] مرحله 1: دریافت لیست DHCP Leases...');
+      List<Map<String, String>> leases = [];
+      
+      // تلاش برای استفاده از فیلتر (اگر MAC یا IP مشخص است)
+      // RouterOS API از فرمت ?=field=value برای فیلتر استفاده می‌کند
+      bool filterSuccess = false;
+      if (macAddress != null) {
+        print('   تلاش با فیلتر MAC: $macAddress');
+        try {
+          leases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=mac-address=$macAddress']).timeout(
+            const Duration(seconds: 10), // کاهش timeout از 20 به 10 ثانیه
+            onTimeout: () {
+              throw TimeoutException('Timeout in filtered query', const Duration(seconds: 10));
+            },
+          );
+          if (leases.isNotEmpty) {
+            filterSuccess = true;
+            print('✅ [STATIC_LEASE] فیلتر MAC موفق - تعداد: ${leases.length}');
+          }
+        } catch (e) {
+          print('⚠️ [STATIC_LEASE] فیلتر MAC ناموفق: $e');
+        }
+      }
+      
+      if (!filterSuccess && ipAddress != null) {
+        print('   تلاش با فیلتر IP: $ipAddress');
+        try {
+          leases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=address=$ipAddress']).timeout(
+            const Duration(seconds: 10), // کاهش timeout از 20 به 10 ثانیه
+            onTimeout: () {
+              throw TimeoutException('Timeout in filtered query', const Duration(seconds: 10));
+            },
+          );
+          if (leases.isNotEmpty) {
+            filterSuccess = true;
+            print('✅ [STATIC_LEASE] فیلتر IP موفق - تعداد: ${leases.length}');
+          }
+        } catch (e) {
+          print('⚠️ [STATIC_LEASE] فیلتر IP ناموفق: $e');
+        }
+      }
+      
+      // اگر فیلتر کار نکرد، فقط در صورت ضرورت از همه leases استفاده کن
+      if (!filterSuccess) {
+        print('⚠️ [STATIC_LEASE] فیلتر کار نکرد - دریافت همه Leases با timeout کوتاه‌تر...');
+        try {
+          leases = await _client!.talk(['/ip/dhcp-server/lease/print']).timeout(
+            const Duration(seconds: 15), // کاهش timeout از 30 به 15 ثانیه
+            onTimeout: () {
+              print('❌ [STATIC_LEASE] Timeout در دریافت همه Leases (15 ثانیه)');
+              throw TimeoutException('زمان دریافت لیست DHCP Leases به پایان رسید', const Duration(seconds: 15));
+            },
+          );
+          print('✅ [STATIC_LEASE] دریافت همه Leases موفق - تعداد: ${leases.length}');
+        } catch (e) {
+          print('❌ [STATIC_LEASE] خطا در دریافت Leases: $e');
+          throw Exception('نمی‌توان Lease را پیدا کرد. لطفاً اتصال را بررسی کنید.');
+        }
+      }
+      
+      Map<String, String>? leaseFound;
+      String? leaseId;
+
+      // مرحله 2: جستجو بر اساس MAC یا IP
+      print('🔍 [STATIC_LEASE] مرحله 2: جستجوی Lease بر اساس MAC یا IP...');
+      int searchIndex = 0;
+      for (var lease in leases) {
+        searchIndex++;
+        bool found = false;
+
+        // بررسی MAC
+        if (macAddress != null) {
+          final leaseMac = lease['mac-address']?.toString().toUpperCase();
+          if (leaseMac != null && leaseMac == macAddress.toUpperCase()) {
+            found = true;
+            print('✅ [STATIC_LEASE] Lease پیدا شد (بر اساس MAC) - Index: $searchIndex');
+            print('   MAC: $leaseMac');
+          }
+        }
+
+        // بررسی IP
+        if (!found && ipAddress != null) {
+          final leaseIp = lease['address']?.toString();
+          if (leaseIp == ipAddress) {
+            found = true;
+            print('✅ [STATIC_LEASE] Lease پیدا شد (بر اساس IP) - Index: $searchIndex');
+            print('   IP: $leaseIp');
+          }
+        }
+
+        if (found) {
+          leaseFound = Map<String, String>.from(lease.map((key, value) => 
+            MapEntry(key.toString(), value.toString())));
+          leaseId = lease['.id']?.toString();
+          print('📝 [STATIC_LEASE] اطلاعات Lease پیدا شده:');
+          print('   Lease ID: $leaseId');
+          print('   IP: ${leaseFound['address'] ?? "N/A"}');
+          print('   MAC: ${leaseFound['mac-address'] ?? "N/A"}');
+          print('   Hostname: ${leaseFound['host-name'] ?? "N/A"}');
+          print('   Dynamic: ${leaseFound['dynamic'] ?? "N/A"}');
+          print('   Status: ${leaseFound['status'] ?? "N/A"}');
+          print('   Comment: ${leaseFound['comment'] ?? "N/A"}');
+          break;
+        }
+      }
+
+      if (leaseFound == null || leaseId == null) {
+        print('❌ [STATIC_LEASE] خطا: Lease پیدا نشد');
+        print('   MAC: ${macAddress ?? "N/A"}');
+        print('   IP: ${ipAddress ?? "N/A"}');
+        throw Exception('Lease پیدا نشد. مطمئن شوید که دستگاه متصل است و Dynamic Lease دارد.');
+      }
+
+      // مرحله 3: بررسی وضعیت Static
+      print('🔍 [STATIC_LEASE] مرحله 3: بررسی وضعیت Static...');
+      final isAlreadyStatic = leaseFound['dynamic']?.toLowerCase() == 'false';
+      print('   Dynamic flag: ${leaseFound['dynamic'] ?? "N/A"}');
+      print('   Is Already Static: $isAlreadyStatic');
+      
+      if (isAlreadyStatic) {
+        print('ℹ️ [STATIC_LEASE] این Lease قبلاً Static است - نیازی به تبدیل نیست');
+        print('═══════════════════════════════════════════════════════════');
+        return {
+          'status': 'info',
+          'message': 'این Lease قبلاً Static است',
+          'lease': {
+            'ip_address': leaseFound['address'] ?? 'N/A',
+            'mac_address': leaseFound['mac-address'] ?? 'N/A',
+            'hostname': leaseFound['host-name'] ?? 'N/A',
+            'is_static': true,
+          },
+        };
+      }
+
+      // مرحله 4: تبدیل Lease به Static (استفاده از make-static command)
+      print('⚙️ [STATIC_LEASE] مرحله 4: آماده‌سازی برای تبدیل به Static...');
+      print('   Lease ID: $leaseId');
+      
+      // استفاده از make-static command (روش صحیح RouterOS API)
+      // /ip/dhcp-server/lease/make-static numbers=<id>
+      final makeStaticParams = <String>['/ip/dhcp-server/lease/make-static', '=numbers=$leaseId'];
+      print('   Command: /ip/dhcp-server/lease/make-static');
+      print('   Numbers: $leaseId');
+
+      // مرحله 5: اجرای دستور تبدیل به Static
+      print('🚀 [STATIC_LEASE] مرحله 5: اجرای دستور تبدیل به Static...');
+      try {
+        await _client!.talk(makeStaticParams).timeout(
+          const Duration(seconds: 20),
+          onTimeout: () {
+            print('❌ [STATIC_LEASE] Timeout در اجرای دستور make-static (20 ثانیه)');
+            throw TimeoutException('زمان اجرای دستور تبدیل به پایان رسید', const Duration(seconds: 20));
+          },
+        );
+        print('✅ [STATIC_LEASE] دستور make-static با موفقیت اجرا شد');
+      } catch (e) {
+        print('❌ [STATIC_LEASE] خطا در اجرای دستور make-static: $e');
+        throw e;
+      }
+
+      // مرحله 5.5: تنظیم پارامترهای اضافی (comment, host-name, address) بعد از تبدیل
+      print('⚙️ [STATIC_LEASE] مرحله 5.5: تنظیم پارامترهای اضافی...');
+      final updateParams = <String>['/ip/dhcp-server/lease/set', '=.id=$leaseId'];
+      bool hasUpdates = false;
+
+      // اگر IP جدید داده شده، تنظیم کن
+      if (ipAddress != null && ipAddress != leaseFound['address']) {
+        updateParams.add('=address=$ipAddress');
+        print('   IP جدید: $ipAddress (قبلی: ${leaseFound['address']})');
+        hasUpdates = true;
+      }
+
+      // اگر hostname داده شده، تنظیم کن
+      if (hostname != null && hostname.isNotEmpty) {
+        updateParams.add('=host-name=$hostname');
+        print('   Hostname جدید: $hostname (قبلی: ${leaseFound['host-name'] ?? "N/A"})');
+        hasUpdates = true;
+      }
+
+      // اگر comment داده شده، تنظیم کن
+      if (comment != null && comment.isNotEmpty) {
+        updateParams.add('=comment=$comment');
+        print('   Comment جدید: $comment (قبلی: ${leaseFound['comment'] ?? "N/A"})');
+        hasUpdates = true;
+      }
+
+      if (hasUpdates) {
+        print('📤 [STATIC_LEASE] به‌روزرسانی پارامترها:');
+        for (var param in updateParams) {
+          print('   $param');
+        }
+        try {
+          await _client!.talk(updateParams).timeout(
+            const Duration(seconds: 20),
+            onTimeout: () {
+              print('⚠️ [STATIC_LEASE] Timeout در به‌روزرسانی پارامترها (20 ثانیه) - ادامه می‌دهیم');
+              // به‌روزرسانی پارامترها اختیاری است، ادامه می‌دهیم
+              return <Map<String, String>>[];
+            },
+          );
+          print('✅ [STATIC_LEASE] پارامترها با موفقیت به‌روزرسانی شدند');
+        } catch (e) {
+          print('⚠️ [STATIC_LEASE] خطا در به‌روزرسانی پارامترها (ادامه می‌دهیم): $e');
+          // به‌روزرسانی پارامترها اختیاری است، ادامه می‌دهیم
+        }
+      } else {
+        print('ℹ️ [STATIC_LEASE] هیچ پارامتر اضافی برای به‌روزرسانی وجود ندارد');
+      }
+
+      // مرحله 6: دریافت اطلاعات نهایی (بعد از تبدیل و به‌روزرسانی)
+      print('📥 [STATIC_LEASE] مرحله 6: دریافت اطلاعات نهایی Lease...');
+      print('   Lease ID: $leaseId');
+      print('   MAC: ${macAddress ?? "N/A"}');
+      print('   IP: ${ipAddress ?? "N/A"}');
+      
+      // استفاده از MAC 或 IP 来查询，因为 make-static 后 ID 可能改变
+      List<Map<String, String>> updatedLeases = [];
+      try {
+        if (macAddress != null) {
+          print('   استفاده از MAC برای جستجو: $macAddress');
+          updatedLeases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=mac-address=$macAddress']).timeout(
+            const Duration(seconds: 20),
+            onTimeout: () {
+              print('⚠️ [STATIC_LEASE] Timeout در دریافت با MAC - استفاده از اطلاعات قبلی');
+              return <Map<String, String>>[];
+            },
+          );
+        } else if (ipAddress != null) {
+          print('   استفاده از IP برای جستجو: $ipAddress');
+          updatedLeases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=address=$ipAddress']).timeout(
+            const Duration(seconds: 20),
+            onTimeout: () {
+              print('⚠️ [STATIC_LEASE] Timeout در دریافت با IP - استفاده از اطلاعات قبلی');
+              return <Map<String, String>>[];
+            },
+          );
+        }
+        
+        // 如果过滤查询返回空，尝试获取所有 leases 然后过滤
+        if (updatedLeases.isEmpty) {
+          print('   فیلتر خالی بود - دریافت همه Leases برای جستجو...');
+          final allLeases = await _client!.talk(['/ip/dhcp-server/lease/print']).timeout(
+            const Duration(seconds: 20),
+            onTimeout: () {
+              print('⚠️ [STATIC_LEASE] Timeout در دریافت همه Leases - استفاده از اطلاعات قبلی');
+              return <Map<String, String>>[];
+            },
+          );
+          
+          // 手动过滤
+          for (var lease in allLeases) {
+            bool found = false;
+            if (macAddress != null) {
+              final leaseMac = lease['mac-address']?.toString().toUpperCase();
+              if (leaseMac != null && leaseMac == macAddress.toUpperCase()) {
+                found = true;
+              }
+            } else if (ipAddress != null) {
+              final leaseIp = lease['address']?.toString();
+              if (leaseIp == ipAddress) {
+                found = true;
+              }
+            }
+            if (found) {
+              updatedLeases.add(lease);
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        print('⚠️ [STATIC_LEASE] خطا در دریافت اطلاعات نهایی: $e - استفاده از اطلاعات قبلی');
+        updatedLeases = [];
+      }
+      
+      if (updatedLeases.isEmpty) {
+        print('⚠️ [STATIC_LEASE] هشدار: Lease بعد از تبدیل پیدا نشد، استفاده از اطلاعات قبلی');
+      } else {
+        print('✅ [STATIC_LEASE] Lease به‌روزرسانی شده دریافت شد');
+      }
+      
+      final updatedLease = updatedLeases.isNotEmpty 
+          ? updatedLeases[0] 
+          : Map<String, String>.from(leaseFound);
+
+      print('📊 [STATIC_LEASE] اطلاعات نهایی Lease:');
+      print('   IP: ${updatedLease['address'] ?? leaseFound['address'] ?? 'N/A'}');
+      print('   MAC: ${updatedLease['mac-address'] ?? leaseFound['mac-address'] ?? 'N/A'}');
+      print('   Hostname: ${updatedLease['host-name'] ?? hostname ?? leaseFound['host-name'] ?? 'N/A'}');
+      print('   Comment: ${updatedLease['comment'] ?? comment ?? leaseFound['comment'] ?? 'N/A'}');
+      print('   Dynamic: ${updatedLease['dynamic'] ?? 'false'}');
+      print('   Is Static: ${(updatedLease['dynamic'] ?? 'false').toLowerCase() == 'false'}');
+
+      print('✅ [STATIC_LEASE] فرآیند تبدیل به Static با موفقیت کامل شد');
+      print('═══════════════════════════════════════════════════════════');
+
+      return {
+        'status': 'success',
+        'message': 'Lease با موفقیت به Static تبدیل شد',
+        'lease': {
+          'ip_address': updatedLease['address'] ?? leaseFound['address'] ?? 'N/A',
+          'mac_address': updatedLease['mac-address'] ?? leaseFound['mac-address'] ?? 'N/A',
+          'hostname': updatedLease['host-name'] ?? hostname ?? leaseFound['host-name'] ?? 'N/A',
+          'comment': updatedLease['comment'] ?? comment ?? leaseFound['comment'] ?? 'N/A',
+          'is_static': true,
+          'dynamic': updatedLease['dynamic'] ?? 'false',
+        },
+        'benefits': [
+          'IP address همیشه یکسان است',
+          'Hostname ثابت می‌ماند',
+          'شناسایی دستگاه آسان‌تر است',
+          'برای Ban بهتر است',
+        ],
+      };
+    } catch (e) {
+      print('❌ [STATIC_LEASE] خطا در تبدیل به Static: $e');
+      print('═══════════════════════════════════════════════════════════');
+      throw Exception('خطا در تبدیل به Static: $e');
+    }
+  }
+
+  /// دریافت وضعیت Lease (Static/Dynamic)
+  /// Returns: true = static, false = dynamic, null = not found
+  Future<bool?> getLeaseStatus({
+    String? macAddress,
+    String? ipAddress,
+  }) async {
+    if (_client == null || !isConnected) {
+      return null;
+    }
+
+    if (macAddress == null && ipAddress == null) {
+      return null;
+    }
+
+    try {
+      // استفاده از فیلتر برای سرعت بیشتر
+      List<Map<String, String>> leases = [];
+      bool filterSuccess = false;
+      
+      // تلاش برای استفاده از فیلتر MAC (سریع‌تر)
+      if (macAddress != null) {
+        try {
+          leases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=mac-address=$macAddress']).timeout(
+            const Duration(seconds: 5), // timeout کوتاه برای سرعت
+            onTimeout: () => <Map<String, String>>[],
+          );
+          if (leases.isNotEmpty) {
+            filterSuccess = true;
+          }
+        } catch (e) {
+          // فیلتر ناموفق - ادامه می‌دهیم
+        }
+      }
+      
+      // اگر فیلتر MAC ناموفق بود، تلاش با فیلتر IP
+      if (!filterSuccess && ipAddress != null) {
+        try {
+          leases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=address=$ipAddress']).timeout(
+            const Duration(seconds: 5), // timeout کوتاه برای سرعت
+            onTimeout: () => <Map<String, String>>[],
+          );
+          if (leases.isNotEmpty) {
+            filterSuccess = true;
+          }
+        } catch (e) {
+          // فیلتر ناموفق - ادامه می‌دهیم
+        }
+      }
+      
+      // اگر فیلتر کار نکرد، از همه leases استفاده کن (با timeout کوتاه)
+      if (!filterSuccess) {
+        leases = await _client!.talk(['/ip/dhcp-server/lease/print']).timeout(
+          const Duration(seconds: 8), // timeout کوتاه‌تر برای سرعت
+          onTimeout: () => <Map<String, String>>[],
+        );
+      }
+
+      for (var lease in leases) {
+        bool found = false;
+        
+        if (macAddress != null) {
+          final leaseMac = lease['mac-address']?.toString().toUpperCase();
+          if (leaseMac != null && leaseMac == macAddress.toUpperCase()) {
+            found = true;
+          }
+        }
+        
+        if (!found && ipAddress != null) {
+          final leaseIp = lease['address']?.toString();
+          if (leaseIp == ipAddress) {
+            found = true;
+          }
+        }
+        
+        if (found) {
+          final dynamicValue = lease['dynamic']?.toString().toLowerCase();
+          return dynamicValue == 'false';
+        }
+      }
+
+      return null; // Lease پیدا نشد
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// تبدیل Static DHCP Lease به Dynamic Lease
+  Future<Map<String, dynamic>> makeDynamicLease({
+    required String? macAddress,
+    required String? ipAddress,
+  }) async {
+    print('═══════════════════════════════════════════════════════════');
+    print('🔧 [DYNAMIC_LEASE] شروع فرآیند تبدیل به Dynamic Lease');
+    print('🔧 [DYNAMIC_LEASE] MAC Address: ${macAddress ?? "N/A"}');
+    print('🔧 [DYNAMIC_LEASE] IP Address: ${ipAddress ?? "N/A"}');
+    print('═══════════════════════════════════════════════════════════');
+
+    if (_client == null || !isConnected) {
+      print('❌ [DYNAMIC_LEASE] خطا: اتصال برقرار نشده');
+      throw Exception('اتصال برقرار نشده');
+    }
+
+    if (macAddress == null && ipAddress == null) {
+      print('❌ [DYNAMIC_LEASE] خطا: باید MAC address یا IP address را وارد کنید');
+      throw Exception('باید MAC address یا IP address را وارد کنید');
+    }
+
+    try {
+      // مرحله 1: دریافت لیست Leases (با استفاده از فیلتر برای سرعت بیشتر)
+      print('📋 [DYNAMIC_LEASE] مرحله 1: دریافت لیست DHCP Leases...');
+      List<Map<String, String>> leases = [];
+      
+      // تلاش برای استفاده از فیلتر (سریع‌تر)
+      bool filterSuccess = false;
+      if (macAddress != null) {
+        print('   تلاش با فیلتر MAC: $macAddress');
+        try {
+          leases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=mac-address=$macAddress']).timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              throw TimeoutException('Timeout in filtered query', const Duration(seconds: 10));
+            },
+          );
+          if (leases.isNotEmpty) {
+            filterSuccess = true;
+            print('✅ [DYNAMIC_LEASE] فیلتر MAC موفق - تعداد: ${leases.length}');
+          }
+        } catch (e) {
+          print('⚠️ [DYNAMIC_LEASE] فیلتر MAC ناموفق: $e');
+        }
+      }
+      
+      if (!filterSuccess && ipAddress != null) {
+        print('   تلاش با فیلتر IP: $ipAddress');
+        try {
+          leases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=address=$ipAddress']).timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              throw TimeoutException('Timeout in filtered query', const Duration(seconds: 10));
+            },
+          );
+          if (leases.isNotEmpty) {
+            filterSuccess = true;
+            print('✅ [DYNAMIC_LEASE] فیلتر IP موفق - تعداد: ${leases.length}');
+          }
+        } catch (e) {
+          print('⚠️ [DYNAMIC_LEASE] فیلتر IP ناموفق: $e');
+        }
+      }
+      
+      // اگر فیلتر کار نکرد، فقط در صورت ضرورت از همه leases استفاده کن (با timeout کوتاه‌تر)
+      if (!filterSuccess) {
+        print('⚠️ [DYNAMIC_LEASE] فیلتر کار نکرد - تلاش با timeout کوتاه‌تر...');
+        try {
+          leases = await _client!.talk(['/ip/dhcp-server/lease/print']).timeout(
+            const Duration(seconds: 15), // کاهش timeout از 30 به 15 ثانیه
+            onTimeout: () {
+              print('❌ [DYNAMIC_LEASE] Timeout در دریافت همه Leases (15 ثانیه)');
+              throw TimeoutException('زمان دریافت لیست DHCP Leases به پایان رسید', const Duration(seconds: 15));
+            },
+          );
+          print('✅ [DYNAMIC_LEASE] دریافت همه Leases موفق - تعداد: ${leases.length}');
+        } catch (e) {
+          print('❌ [DYNAMIC_LEASE] خطا در دریافت Leases: $e');
+          throw Exception('نمی‌توان Lease را پیدا کرد. لطفاً اتصال را بررسی کنید.');
+        }
+      }
+      
+      Map<String, String>? leaseFound;
+      String? leaseId;
+
+      // مرحله 2: جستجو
+      print('🔍 [DYNAMIC_LEASE] مرحله 2: جستجوی Lease...');
+      for (var lease in leases) {
+        bool found = false;
+
+        if (macAddress != null) {
+          final leaseMac = lease['mac-address']?.toString().toUpperCase();
+          if (leaseMac != null && leaseMac == macAddress.toUpperCase()) {
+            found = true;
+          }
+        }
+
+        if (!found && ipAddress != null) {
+          final leaseIp = lease['address']?.toString();
+          if (leaseIp == ipAddress) {
+            found = true;
+          }
+        }
+
+        if (found) {
+          leaseFound = Map<String, String>.from(lease.map((key, value) => 
+            MapEntry(key.toString(), value.toString())));
+          leaseId = lease['.id']?.toString();
+          break;
+        }
+      }
+
+      if (leaseFound == null || leaseId == null) {
+        print('❌ [DYNAMIC_LEASE] خطا: Lease پیدا نشد');
+        throw Exception('Lease پیدا نشد.');
+      }
+
+      // مرحله 3: بررسی وضعیت
+      print('🔍 [DYNAMIC_LEASE] مرحله 3: بررسی وضعیت...');
+      final isStatic = leaseFound['dynamic']?.toLowerCase() == 'false';
+      print('   Dynamic flag: ${leaseFound['dynamic'] ?? "N/A"}');
+      print('   Is Static: $isStatic');
+      
+      if (!isStatic) {
+        print('ℹ️ [DYNAMIC_LEASE] این Lease قبلاً Dynamic است');
+        return {
+          'status': 'info',
+          'message': 'این Lease قبلاً Dynamic است',
+          'lease': {
+            'ip_address': leaseFound['address'] ?? 'N/A',
+            'mac_address': leaseFound['mac-address'] ?? 'N/A',
+            'hostname': leaseFound['host-name'] ?? 'N/A',
+            'is_static': false,
+          },
+        };
+      }
+
+      // مرحله 4: حذف Static Lease (این کار lease را به dynamic تبدیل می‌کند)
+      print('🚀 [DYNAMIC_LEASE] مرحله 4: حذف Static Lease...');
+      print('   Lease ID: $leaseId');
+      bool removeSuccess = false;
+      try {
+        await _client!.talk(['/ip/dhcp-server/lease/remove', '=.id=$leaseId']).timeout(
+          const Duration(seconds: 20), // افزایش timeout به 20 ثانیه
+          onTimeout: () {
+            print('⚠️ [DYNAMIC_LEASE] Timeout در حذف Lease (20 ثانیه) - بررسی اینکه آیا حذف شده است...');
+            // Timeout 发生了，但我们需要验证操作是否成功
+            return <Map<String, String>>[];
+          },
+        );
+        print('✅ [DYNAMIC_LEASE] دستور حذف با موفقیت اجرا شد');
+        removeSuccess = true;
+      } catch (e) {
+        if (e is TimeoutException) {
+          print('⚠️ [DYNAMIC_LEASE] Timeout در حذف - بررسی اینکه آیا حذف شده است...');
+          // Timeout 发生了，但我们需要验证操作是否成功
+        } else {
+          print('❌ [DYNAMIC_LEASE] خطا در حذف Lease: $e');
+          // 如果不是 timeout，可能是真正的错误
+          throw e;
+        }
+      }
+
+      // مرحله 5: بررسی اینکه آیا Lease حذف شده است (حتی اگر timeout شده باشد)
+      print('🔍 [DYNAMIC_LEASE] مرحله 5: بررسی اینکه آیا Lease حذف شده است...');
+      try {
+        // 等待一小段时间让操作完成
+        await Future.delayed(const Duration(milliseconds: 500));
+        
+        // 尝试查找 lease - 如果找不到，说明删除成功
+        List<Map<String, String>> checkLeases = [];
+        try {
+          if (macAddress != null) {
+            checkLeases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=mac-address=$macAddress']).timeout(
+              const Duration(seconds: 5),
+              onTimeout: () => <Map<String, String>>[],
+            );
+          } else if (ipAddress != null) {
+            checkLeases = await _client!.talk(['/ip/dhcp-server/lease/print', '?=address=$ipAddress']).timeout(
+              const Duration(seconds: 5),
+              onTimeout: () => <Map<String, String>>[],
+            );
+          }
+        } catch (e) {
+          print('⚠️ [DYNAMIC_LEASE] خطا در بررسی - استفاده از همه leases...');
+          checkLeases = await _client!.talk(['/ip/dhcp-server/lease/print']).timeout(
+            const Duration(seconds: 5),
+            onTimeout: () => <Map<String, String>>[],
+          );
+        }
+
+        // 检查是否找到了原来的 static lease
+        bool foundStaticLease = false;
+        for (var lease in checkLeases) {
+          bool matches = false;
+          if (macAddress != null) {
+            final leaseMac = lease['mac-address']?.toString().toUpperCase();
+            if (leaseMac != null && leaseMac == macAddress.toUpperCase()) {
+              matches = true;
+            }
+          } else if (ipAddress != null) {
+            final leaseIp = lease['address']?.toString();
+            if (leaseIp == ipAddress) {
+              matches = true;
+            }
+          }
+          
+          if (matches) {
+            final isStillStatic = lease['dynamic']?.toLowerCase() == 'false';
+            if (isStillStatic) {
+              foundStaticLease = true;
+              print('⚠️ [DYNAMIC_LEASE] Lease هنوز Static است - حذف ناموفق بود');
+              break;
+            } else {
+              print('✅ [DYNAMIC_LEASE] Lease پیدا شد اما Dynamic است - حذف موفق بود');
+            }
+          }
+        }
+
+        if (!foundStaticLease) {
+          print('✅ [DYNAMIC_LEASE] Static Lease حذف شد (یا Dynamic شده است)');
+          removeSuccess = true;
+        } else if (!removeSuccess) {
+          // 如果找到了 static lease 且删除命令没有成功，抛出错误
+          throw Exception('Lease هنوز Static است - حذف ناموفق بود');
+        }
+      } catch (e) {
+        if (removeSuccess) {
+          // 如果删除命令成功，即使验证失败也认为成功
+          print('✅ [DYNAMIC_LEASE] دستور حذف موفق بود (تأیید ناموفق اما ادامه می‌دهیم)');
+        } else {
+          print('❌ [DYNAMIC_LEASE] خطا در تأیید حذف: $e');
+          throw Exception('خطا در حذف Lease: $e');
+        }
+      }
+
+      print('✅ [DYNAMIC_LEASE] فرآیند تبدیل به Dynamic با موفقیت کامل شد');
+      print('═══════════════════════════════════════════════════════════');
+
+      return {
+        'status': 'success',
+        'message': 'Lease با موفقیت به Dynamic تبدیل شد',
+        'lease': {
+          'ip_address': leaseFound['address'] ?? 'N/A',
+          'mac_address': leaseFound['mac-address'] ?? 'N/A',
+          'hostname': leaseFound['host-name'] ?? 'N/A',
+          'is_static': false,
+        },
+      };
+    } catch (e) {
+      print('❌ [DYNAMIC_LEASE] خطا در تبدیل به Dynamic: $e');
+      print('═══════════════════════════════════════════════════════════');
+      throw Exception('خطا در تبدیل به Dynamic: $e');
     }
   }
 }
