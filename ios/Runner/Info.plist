@@ -54,5 +54,16 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>برای اتصال به روتر MikroTik در شبکه محلی و مدیریت اینترنت، دسترسی به شبکه محلی لازم است.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+		<string>_api._tcp</string>
+	</array>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>برای تشخیص خودکار نام شبکه Wi-Fi و آدرس Gateway روتر، دسترسی به موقعیت مکانی لازم است.</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 </dict>
 </plist>

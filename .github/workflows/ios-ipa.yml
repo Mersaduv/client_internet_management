@@ -1,0 +1,39 @@
+name: Build iOS IPA (unsigned)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.9
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build iOS without code signing
+        run: flutter build ios --release --no-codesign
+
+      - name: Package Runner.app into an IPA
+        run: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -R Runner.app Payload/
+          zip -qry Ariyabod-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ariyabod-ios-unsigned-ipa
+          path: build/ios/iphoneos/Ariyabod-unsigned.ipa
+          if-no-files-found: error
