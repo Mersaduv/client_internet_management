@@ -62,6 +62,12 @@ while ((Get-Date) -lt $deadline) {
                 Write-Host "Build succeeded (run #$($run.run_number))." -ForegroundColor Green
                 break
             }
+            # Artifact may exist even if release step failed
+            $artifacts = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/actions/runs/$($run.id)/artifacts"
+            if ($artifacts.total_count -gt 0) {
+                Write-Host "Build finished with issues, but artifact is available." -ForegroundColor Yellow
+                break
+            }
             throw "Build failed: $($run.html_url)"
         }
         Write-Host "  Status: $($run.status) ..." -ForegroundColor DarkGray
