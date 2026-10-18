@@ -1,7 +1,7 @@
 [Setup]
 AppId={{9D14829D-5B3D-4208-BFCA-0A1A2B95C7F1}
 AppName=Ariyabod
-AppVersion=1.3.0
+AppVersion=1.4.0
 AppPublisher=Ariyabod
 DefaultDirName={autopf}\Ariyabod
 DefaultGroupName=Ariyabod
@@ -22,7 +22,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Bundle Flutter Windows Release output; skip WebView2 caches created next to the exe.
+Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.WebView2\*"
 
 [Icons]
 Name: "{autoprograms}\Ariyabod"; Filename: "{app}\Ariyabod.exe"

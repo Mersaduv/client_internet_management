@@ -1506,6 +1506,7 @@ class ClientsProvider extends ChangeNotifier {
     }
 
     if (anyChanged) {
+      _rebuildDisplayCache();
       notifyListeners();
     }
   }
@@ -1756,6 +1757,7 @@ class ClientsProvider extends ChangeNotifier {
       }
 
       if (anyChanged) {
+        _rebuildDisplayCache();
         notifyListeners();
       }
     } catch (e) {

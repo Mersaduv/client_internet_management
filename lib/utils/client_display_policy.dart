@@ -23,9 +23,13 @@ class ClientDisplayPolicy {
     return hasValidIp(client.ipAddress);
   }
 
-  /// Connected tab — every device with a usable IP (pending approval included).
+  /// Connected tab — devices with a usable IP that are not known to be offline.
+  /// `isOnline == null` means not evaluated yet, so it stays visible.
   static bool shouldShowInConnectedListUi(ClientInfo client) {
-    return shouldShowInConnectedList(client);
+    if (!shouldShowInConnectedList(client)) {
+      return false;
+    }
+    return client.isOnline != false;
   }
 
   /// Ban, speed, lease rename, etc. require a target IP.

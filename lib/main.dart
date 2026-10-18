@@ -29,6 +29,7 @@ import 'utils/app_theme.dart';
 import 'widgets/client_live_traffic_badge.dart';
 import 'widgets/traffic_list_item_visibility.dart';
 import 'utils/wifi_panel_url_resolver.dart';
+import 'utils/webview_environment.dart';
 
 // 全局回调函数，用于从子组件通知主应用更改语言
 Function(Locale)? onLanguageChanged;
@@ -39,7 +40,9 @@ Function(ThemeMode)? onThemeChanged;
 final RouteObserver<PageRoute<dynamic>> routeObserver =
     RouteObserver<PageRoute<dynamic>>();
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await ensureWindowsWebViewEnvironment();
   runApp(const MyApp());
 }
 

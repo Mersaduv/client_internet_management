@@ -4,8 +4,58 @@
 #include <io.h>
 #include <stdio.h>
 #include <windows.h>
+#include <shlobj.h>
 
 #include <iostream>
+#include <string>
+
+namespace {
+
+bool DirectoryExists(const std::wstring& path) {
+  const DWORD attrs = ::GetFileAttributesW(path.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES &&
+         (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool EnsureDirectoryTree(const std::wstring& path) {
+  if (DirectoryExists(path)) {
+    return true;
+  }
+  const size_t slash = path.find_last_of(L"\\/");
+  if (slash != std::wstring::npos && slash > 0) {
+    if (!EnsureDirectoryTree(path.substr(0, slash))) {
+      return false;
+    }
+  }
+  return ::CreateDirectoryW(path.c_str(), nullptr) != 0 ||
+         ::GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+}  // namespace
+
+void EnsureWebView2UserDataFolder() {
+  // Respect an explicit override from the environment / launcher.
+  wchar_t existing[MAX_PATH] = {};
+  const DWORD existing_len =
+      ::GetEnvironmentVariableW(L"WEBVIEW2_USER_DATA_FOLDER", existing, MAX_PATH);
+  if (existing_len > 0 && existing_len < MAX_PATH) {
+    return;
+  }
+
+  wchar_t local_app_data[MAX_PATH] = {};
+  if (FAILED(::SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr,
+                                SHGFP_TYPE_CURRENT, local_app_data))) {
+    return;
+  }
+
+  const std::wstring user_data =
+      std::wstring(local_app_data) + L"\\Ariyabod\\WebView2";
+  if (!EnsureDirectoryTree(user_data)) {
+    return;
+  }
+
+  ::SetEnvironmentVariableW(L"WEBVIEW2_USER_DATA_FOLDER", user_data.c_str());
+}
 
 void CreateAndAttachConsole() {
   if (::AllocConsole()) {

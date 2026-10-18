@@ -86,13 +86,27 @@ $outFile = Join-Path $distDir $ipaName
 $assetDeadline = (Get-Date).AddMinutes(3)
 while ((Get-Date) -lt $assetDeadline) {
     try {
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $outFile -ErrorAction Stop
+        curl.exe -L --fail --retry 3 --output $outFile $downloadUrl
         Write-Host ""
         Write-Host "IPA saved to:" -ForegroundColor Green
         Write-Host "  $outFile"
         Write-Host ""
         exit 0
     } catch {
+        # Also try latest release API in case tag name differs
+        try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag"
+            $asset = $release.assets | Where-Object { $_.name -like "*.ipa" } | Select-Object -First 1
+            if ($asset) {
+                $outPath = Join-Path $distDir $asset.name
+                curl.exe -L --fail --retry 3 --output $outPath $asset.browser_download_url
+                Write-Host ""
+                Write-Host "IPA saved to:" -ForegroundColor Green
+                Write-Host "  $outPath"
+                Write-Host ""
+                exit 0
+            }
+        } catch {}
         Start-Sleep -Seconds 10
     }
 }

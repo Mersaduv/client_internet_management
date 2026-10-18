@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import '../services/settings_service.dart';
 import '../utils/app_theme.dart';
+import '../utils/webview_environment.dart';
 
 /// بعد از بارگذاری، محدودیت viewport (مثل user-scalable=no) را شل می‌کند تا pinch روی اندروید و iOS جواب بدهد.
 const String _kUnrestrictViewportForPinchZoom = r'''
@@ -272,6 +273,7 @@ class _InternetServiceScreenState extends State<InternetServiceScreen> {
           if (!_showError && _currentUrl != null)
             InAppWebView(
               preventGestureDelay: true,
+              webViewEnvironment: windowsWebViewEnvironment,
               initialUserScripts: UnmodifiableListView<UserScript>([
                 UserScript(
                   groupName: 'pinch_zoom_viewport',
